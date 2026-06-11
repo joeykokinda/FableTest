@@ -84,8 +84,8 @@ const dist2 = (ax, ay, bx, by) => (ax - bx) * (ax - bx) + (ay - by) * (ay - by);
 // ---------------------------------------------------------------- tuner state
 
 const FREQ_MIN = 87.0, FREQ_MAX = 108.0;
-let freq = 96.2;
-let targetFreq = 96.2;
+let freq = 87.9;
+let targetFreq = 87.9;
 let started = false;
 let bootAt = 0;
 let timeNow = 0;
@@ -138,17 +138,28 @@ addEventListener('pointermove', e => {
   mouse.x = e.clientX; mouse.y = e.clientY;
   mouse.lastT = now; mouse.lastMove = now;
   lastInput = now;
+  if (e.pointerType === 'mouse' && (e.buttons & 1) === 0 && mouse.down) {
+    mouse.down = false; dialDragging = false;
+  }
   if (dialDragging) targetFreq = xToFreq(e.clientX);
 });
+
+addEventListener('pointercancel', () => { mouse.down = false; dialDragging = false; });
+addEventListener('blur', () => { mouse.down = false; dialDragging = false; });
+
+const clickRipples = [];
+let deadClick = null;
 
 addEventListener('pointerdown', e => {
   mouse.x = e.clientX; mouse.y = e.clientY;
   mouse.down = true;
   lastInput = performance.now();
   if (!started) return;
+  clickRipples.push({ x: e.clientX, y: e.clientY, t: 0 });
   if (dialZone(e.clientY)) { dialDragging = true; targetFreq = xToFreq(e.clientX); return; }
   const st = strongestStation();
   if (st && st.signal > 0.45 && st.onClick) st.onClick(e.clientX, e.clientY);
+  else if (!st || st.signal < 0.45) deadClick = { x: e.clientX, y: e.clientY, born: timeNow };
 });
 
 addEventListener('pointerup', () => { mouse.down = false; dialDragging = false; });
@@ -376,12 +387,15 @@ const stationRain = {
     const count = Math.ceil(W / this.cs);
     this.streams = [];
     for (let i = 0; i < count; i++) {
+      const layer = Math.random() < 0.3 ? 0 : Math.random() < 0.55 ? 1 : 2;
       this.streams.push({
-        col: i, y: rand(-H, H), sp: rand(130, 380), len: (rand(8, 22)) | 0,
+        col: i, y: rand(-H, H), sp: rand(130, 380) * [0.55, 1, 1.5][layer], len: (rand(8, 22)) | 0,
         xoff: 0, xv: 0, seed: (Math.random() * 1000) | 0,
         word: Math.random() < 0.05 ? pick(RAIN_WORDS) : null,
+        layer, cs: [12, 18, 24][layer], dim: [0.40, 0.75, 1][layer],
       });
     }
+    this.streams.sort((a, b) => a.layer - b.layer);
   },
 
   onClick(x, y) { this.shock = { x, y, t: 0 }; blip(140, 0.4, 'sawtooth', 0.10, 50); },
@@ -429,24 +443,35 @@ const stationRain = {
   draw(a) {
     ctx.save();
     ctx.globalAlpha = a;
-    ctx.font = this.cs + 'px "VT323", monospace';
     ctx.textBaseline = 'top';
     const flick = Math.floor(timeNow * 9);
+    let currentLayer = -1;
     for (const s of this.streams) {
+      if (s.layer !== currentLayer) {
+        currentLayer = s.layer;
+        ctx.font = s.cs + 'px "VT323", monospace';
+      }
       const x = s.col * this.cs + s.xoff;
       for (let i = 0; i < s.len; i++) {
-        const y = s.y - i * this.cs;
-        if (y < -this.cs || y > H) continue;
+        const y = s.y - i * s.cs;
+        if (y < -s.cs || y > H) continue;
         let ch;
         if (s.word && i > 0 && i <= s.word.length) {
           ch = s.word[s.word.length - i];
         } else {
-          const gi = (s.seed + s.col * 31 + ((y / this.cs) | 0) * 7 + ((flick + i) % 3 === 0 ? flick : 0)) % RAIN_GLYPHS.length;
+          const gi = (s.seed + s.col * 31 + ((y / s.cs) | 0) * 7 + ((flick + i) % 3 === 0 ? flick : 0)) % RAIN_GLYPHS.length;
           ch = RAIN_GLYPHS[Math.abs(gi)];
         }
-        const fade = 1 - i / s.len;
+        const fade = (1 - i / s.len) * s.dim;
         if (i === 0) {
-          ctx.fillStyle = 'rgba(220,255,230,' + (0.95 * a) + ')';
+          if (s.layer === 2) {
+            ctx.shadowColor = 'rgba(120,255,170,0.9)';
+            ctx.shadowBlur = 10;
+          }
+          ctx.fillStyle = 'rgba(225,255,235,' + (0.95 * s.dim * a) + ')';
+          ctx.fillText(ch, x, y);
+          ctx.shadowBlur = 0;
+          continue;
         } else if (s.word && i <= s.word.length) {
           ctx.fillStyle = 'rgba(190,255,255,' + (fade * 0.95 * a).toFixed(3) + ')';
         } else {
@@ -552,6 +577,20 @@ const stationEmber = {
       if (sp.life <= 0) this.sparks.splice(i, 1);
     }
 
+    // ambient embers rising off the fire bed
+    if (!this.embers) this.embers = [];
+    if (this.signal > 0.3 && this.embers.length < 70 && Math.random() < dt * 14) {
+      this.embers.push({ x: rand(0, W), y: H - rand(0, 40), vx: rand(-12, 12), vy: rand(-90, -30), life: rand(2, 5), seed: rand(0, TAU) });
+    }
+    for (let i = this.embers.length - 1; i >= 0; i--) {
+      const em = this.embers[i];
+      em.life -= dt;
+      em.x += (em.vx + Math.sin(timeNow * 2 + em.seed) * 18 + mouse.dxs * 0.4) * dt;
+      em.y += em.vy * dt;
+      em.vy -= 8 * dt;
+      if (em.life <= 0 || em.y < -10) this.embers.splice(i, 1);
+    }
+
     if (this.signal > 0.5 && Math.random() < dt * 7) {
       blip(rand(900, 3200), 0.025, 'square', 0.035);
     }
@@ -577,6 +616,13 @@ const stationEmber = {
     for (const sp of this.sparks) {
       ctx.fillStyle = 'rgba(255,210,110,' + (clamp(sp.life, 0, 1) * a).toFixed(3) + ')';
       ctx.fillRect(sp.x, sp.y, 2.5, 2.5);
+    }
+    if (this.embers) {
+      for (const em of this.embers) {
+        const flickr = 0.5 + 0.5 * Math.sin(timeNow * 11 + em.seed * 5);
+        ctx.fillStyle = 'rgba(255,' + (140 + flickr * 80 | 0) + ',60,' + (clamp(em.life * 0.5, 0, 0.85) * a).toFixed(3) + ')';
+        ctx.fillRect(em.x, em.y, 2, 2);
+      }
     }
     ctx.restore();
   },
@@ -879,18 +925,42 @@ const stationSwarm = {
     ctx.lineCap = 'round';
     for (const c of this.creatures) {
       const g = c.genes;
+      // tapered luminous body along the tail, with a fainter wide aura
       for (let i = 0; i < c.tail.length - 1; i++) {
         const k = 1 - i / c.tail.length;
-        ctx.strokeStyle = 'hsla(' + g.hue.toFixed(0) + ',80%,60%,' + (k * 0.5 * a).toFixed(3) + ')';
-        ctx.lineWidth = g.size * k;
+        const wave = Math.sin(timeNow * 8 + i * 0.9) * g.size * 0.35 * (1 - k);
+        const px1 = c.tail[i].x, py1 = c.tail[i].y + wave;
+        const px2 = c.tail[i + 1].x, py2 = c.tail[i + 1].y + wave;
+        ctx.strokeStyle = 'hsla(' + g.hue.toFixed(0) + ',85%,40%,' + (k * 0.22 * a).toFixed(3) + ')';
+        ctx.lineWidth = g.size * k * 2.6;
         ctx.beginPath();
-        ctx.moveTo(c.tail[i].x, c.tail[i].y);
-        ctx.lineTo(c.tail[i + 1].x, c.tail[i + 1].y);
+        ctx.moveTo(px1, py1);
+        ctx.lineTo(px2, py2);
+        ctx.stroke();
+        ctx.strokeStyle = 'hsla(' + g.hue.toFixed(0) + ',85%,65%,' + (k * 0.6 * a).toFixed(3) + ')';
+        ctx.lineWidth = Math.max(0.6, g.size * k);
+        ctx.beginPath();
+        ctx.moveTo(px1, py1);
+        ctx.lineTo(px2, py2);
         ctx.stroke();
       }
+      // glowing head with eye
+      const sp = Math.hypot(c.vx, c.vy) + 0.001;
+      const hx = c.vx / sp, hy = c.vy / sp;
+      ctx.shadowColor = 'hsla(' + g.hue.toFixed(0) + ',90%,70%,0.9)';
+      ctx.shadowBlur = 9;
       ctx.fillStyle = 'hsla(' + g.hue.toFixed(0) + ',90%,72%,' + (0.95 * a) + ')';
       ctx.beginPath();
       ctx.arc(c.x, c.y, g.size, 0, TAU);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(255,255,255,' + (0.9 * a) + ')';
+      ctx.beginPath();
+      ctx.arc(c.x + hx * g.size * 0.45, c.y + hy * g.size * 0.45, Math.max(0.8, g.size * 0.30), 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(10,10,20,' + (0.9 * a) + ')';
+      ctx.beginPath();
+      ctx.arc(c.x + hx * g.size * 0.55, c.y + hy * g.size * 0.55, Math.max(0.4, g.size * 0.14), 0, TAU);
       ctx.fill();
     }
     ctx.restore();
@@ -917,6 +987,10 @@ const stationCollapse = {
     for (let i = 0; i < 850; i++) this.particles.push(this.spawn());
     this.wells = [];
     this.shocks = [];
+    this.bgStars = [];
+    for (let i = 0; i < 240; i++) {
+      this.bgStars.push({ x: Math.random() * W, y: Math.random() * H, r: rand(0.4, 1.4), tw: rand(0, TAU) });
+    }
   },
 
   spawn() {
@@ -1031,7 +1105,30 @@ const stationCollapse = {
       tc.beginPath();
       tc.arc(w.x, w.y, radius * 6, 0, TAU);
       tc.fill();
-      tc.strokeStyle = 'rgba(255,180,255,' + (0.8 * fade) + ')';
+
+      // accretion disk: tilted rotating ellipse, hot inner edge
+      tc.save();
+      tc.translate(w.x, w.y);
+      tc.rotate(0.5 + Math.sin(w.eaten * 0.1) * 0.2);
+      const spin = timeNow * (2.2 + w.m * 0.3);
+      for (let ring = 0; ring < 3; ring++) {
+        const rr = radius * (1.7 + ring * 0.85);
+        const heat = 1 - ring * 0.3;
+        tc.strokeStyle = 'hsla(' + (280 + ring * 25) + ',90%,' + (62 - ring * 12) + '%,' + (0.5 * heat * fade) + ')';
+        tc.lineWidth = 2.4 - ring * 0.6;
+        tc.beginPath();
+        tc.ellipse(0, 0, rr, rr * 0.32, 0, spin + ring * 1.9, spin + ring * 1.9 + 4.4);
+        tc.stroke();
+      }
+      tc.restore();
+
+      // photon ring: thin, perfectly circular, too bright
+      tc.strokeStyle = 'rgba(255,240,255,' + (0.85 * fade) + ')';
+      tc.lineWidth = 1.2;
+      tc.beginPath();
+      tc.arc(w.x, w.y, radius * 1.18, 0, TAU);
+      tc.stroke();
+      tc.strokeStyle = 'rgba(255,180,255,' + (0.55 * fade) + ')';
       tc.lineWidth = 1.5;
       tc.beginPath();
       tc.arc(w.x, w.y, radius + Math.sin(timeNow * 5 + w.eaten) * 2, 0, TAU);
@@ -1046,6 +1143,11 @@ const stationCollapse = {
     }
     ctx.save();
     ctx.globalAlpha = a;
+    for (const s of this.bgStars) {
+      const tw = 0.4 + 0.6 * Math.sin(timeNow * 1.3 + s.tw);
+      ctx.fillStyle = 'rgba(190,185,225,' + (tw * 0.5 * a).toFixed(3) + ')';
+      ctx.fillRect(s.x, s.y, s.r, s.r);
+    }
     ctx.drawImage(this.trail, 0, 0);
     ctx.restore();
   },
@@ -1130,11 +1232,14 @@ const stationMirror = {
 
   drawPhantom(tc, x, y, hue, alpha) {
     const jx = rand(-1.5, 1.5), jy = rand(-1.5, 1.5);
+    tc.shadowColor = 'hsla(' + hue + ',85%,65%,0.9)';
+    tc.shadowBlur = 12;
     tc.strokeStyle = 'hsla(' + hue + ',80%,65%,' + alpha + ')';
     tc.lineWidth = 1.5;
     tc.beginPath();
     tc.arc(x + jx, y + jy, 8, 0, TAU);
     tc.stroke();
+    tc.shadowBlur = 0;
     tc.fillStyle = 'hsla(' + hue + ',80%,75%,' + alpha + ')';
     tc.fillRect(x + jx - 1, y + jy - 1, 2, 2);
     tc.strokeStyle = 'hsla(' + ((hue + 120) % 360) + ',80%,65%,' + (alpha * 0.4) + ')';
@@ -1177,6 +1282,17 @@ const stationMirror = {
 
     ctx.save();
     ctx.globalAlpha = a;
+    // echo chamber: slow concentric rings breathing outward from the center
+    const maxR = Math.hypot(W, H) * 0.55;
+    for (let ring = 0; ring < 6; ring++) {
+      const rr = ((timeNow * 26 + ring * maxR / 6) % maxR);
+      const fade = (1 - rr / maxR) * 0.10;
+      ctx.strokeStyle = 'rgba(90,200,190,' + (fade * a).toFixed(3) + ')';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(W / 2, H / 2, rr, 0, TAU);
+      ctx.stroke();
+    }
     ctx.drawImage(this.trail, 0, 0);
     if (this.deviating > 0) {
       ctx.font = '19px "VT323", monospace';
@@ -1355,6 +1471,9 @@ const stationGhost = {
     for (let i = this.lines.length - 1; i >= this.lines.length - visible; i--) {
       const line = this.lines[i];
       const fade = 1 - (this.lines.length - 1 - i) / visible;
+      const newest = i >= this.lines.length - 2;
+      ctx.shadowColor = line.who === 'user' ? 'rgba(255,180,80,0.8)' : 'rgba(120,255,170,0.8)';
+      ctx.shadowBlur = newest ? 7 : 0;
       let x = baseX;
       for (let c = 0; c < line.text.length; c++) {
         const charX = x + c * 11;
@@ -1374,6 +1493,7 @@ const stationGhost = {
         ctx.fillStyle = 'rgba(220,255,230,' + (0.9 * a) + ')';
         ctx.fillRect(x + line.text.length * 11 + 2, y - 18, 11, 22);
       }
+      ctx.shadowBlur = 0;
       y -= lineHeight;
       if (y < 90) break;
     }
@@ -1487,6 +1607,28 @@ const stationNumbers = {
       }
     }
 
+    // rotating dial rings behind the digits
+    ctx.save();
+    ctx.translate(W / 2, H * 0.44);
+    for (let ring = 0; ring < 2; ring++) {
+      const rr = Math.min(W, H) * (0.26 + ring * 0.09);
+      const spin = timeNow * (ring === 0 ? 0.1 : -0.06);
+      ctx.strokeStyle = 'rgba(100,170,120,' + (0.16 * a) + ')';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(0, 0, rr, 0, TAU);
+      ctx.stroke();
+      for (let tick = 0; tick < 36; tick++) {
+        const ang = spin + tick * TAU / 36;
+        const long = tick % 6 === 0;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(ang) * rr, Math.sin(ang) * rr);
+        ctx.lineTo(Math.cos(ang) * (rr - (long ? 12 : 6)), Math.sin(ang) * (rr - (long ? 12 : 6)));
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+
     const allFound = visibleFoundCount() === totalVisible();
     const special = this.group === '100.0';
     ctx.textAlign = 'center';
@@ -1543,13 +1685,30 @@ const stationSky = {
   signal: 0, bgStars: [], userStars: [], names: [], shooting: null, shootTimer: 5, goldFlash: 0,
 
   resize() {
+    const STAR_TINTS = ['205,215,255', '255,240,220', '255,250,245', '255,222,210', '230,235,255'];
     this.bgStars = [];
-    for (let i = 0; i < 320; i++) {
+    for (let i = 0; i < 340; i++) {
       this.bgStars.push({
         x: Math.random() * W, y: Math.random() * H,
-        r: rand(0.4, 1.6), tw: rand(0, TAU), depth: rand(0.3, 1),
+        r: rand(0.4, 1.7), tw: rand(0, TAU), depth: rand(0.3, 1),
+        tint: pick(STAR_TINTS),
       });
     }
+    // the milky way: a dense diagonal river of faint stars
+    this.mwStars = [];
+    const mwAngle = -0.42;
+    const cosA = Math.cos(mwAngle), sinA = Math.sin(mwAngle);
+    for (let i = 0; i < 520; i++) {
+      const along = rand(-0.75, 0.75) * Math.max(W, H) * 1.5;
+      const spread = (rand(-1, 1) + rand(-1, 1) + rand(-1, 1)) / 3 * H * 0.16;
+      this.mwStars.push({
+        x: W / 2 + along * cosA - spread * sinA,
+        y: H * 0.45 + along * sinA + spread * cosA,
+        r: rand(0.3, 1.1), tw: rand(0, TAU),
+        tint: pick(STAR_TINTS),
+      });
+    }
+    this.mwAngle = mwAngle;
   },
 
   clearSky() { this.userStars = []; this.names = []; },
@@ -1630,10 +1789,34 @@ const stationSky = {
       ctx.stroke();
     }
 
+    // milky way glow band
+    ctx.save();
+    ctx.translate(W / 2 + offX * 0.4, H * 0.45 + offY * 0.4);
+    ctx.rotate(this.mwAngle);
+    const mw = ctx.createLinearGradient(0, -H * 0.2, 0, H * 0.2);
+    mw.addColorStop(0, 'rgba(120,130,180,0)');
+    mw.addColorStop(0.42, 'rgba(150,150,200,' + (0.07 * a) + ')');
+    mw.addColorStop(0.5, 'rgba(190,180,210,' + (0.11 * a) + ')');
+    mw.addColorStop(0.58, 'rgba(150,150,200,' + (0.07 * a) + ')');
+    mw.addColorStop(1, 'rgba(120,130,180,0)');
+    ctx.fillStyle = mw;
+    ctx.fillRect(-Math.max(W, H), -H * 0.2, Math.max(W, H) * 2, H * 0.4);
+    ctx.restore();
+    for (const s of this.mwStars) {
+      const tw = 0.3 + 0.5 * Math.sin(timeNow * 1.2 + s.tw);
+      ctx.fillStyle = 'rgba(' + s.tint + ',' + (tw * 0.55 * a).toFixed(3) + ')';
+      ctx.fillRect(s.x + offX * 0.4, s.y + offY * 0.4, s.r, s.r);
+    }
+
     for (const s of this.bgStars) {
       const tw = 0.45 + 0.55 * Math.sin(timeNow * 1.7 + s.tw);
-      ctx.fillStyle = 'rgba(200,215,255,' + (tw * 0.8 * a * s.depth).toFixed(3) + ')';
+      ctx.fillStyle = 'rgba(' + s.tint + ',' + (tw * 0.8 * a * s.depth).toFixed(3) + ')';
       ctx.fillRect(s.x + offX * s.depth, s.y + offY * s.depth, s.r, s.r);
+      if (s.r > 1.4) {
+        ctx.fillStyle = 'rgba(' + s.tint + ',' + (tw * 0.25 * a).toFixed(3) + ')';
+        ctx.fillRect(s.x + offX * s.depth - 2, s.y + offY * s.depth, 5, 1);
+        ctx.fillRect(s.x + offX * s.depth, s.y + offY * s.depth - 2, 1, 5);
+      }
     }
 
     if (this.shooting) {
@@ -1786,6 +1969,34 @@ const stationUndertow = {
       ctx.fill();
     }
 
+    // god rays from the surface
+    for (let ray = 0; ray < 5; ray++) {
+      const sway = Math.sin(timeNow * 0.13 + ray * 2.4) * W * 0.06;
+      const topX = W * (0.12 + ray * 0.19) + sway;
+      const width = W * 0.045 * (1 + 0.3 * Math.sin(timeNow * 0.21 + ray));
+      const tilt = W * 0.10 + sway * 0.5;
+      const shine = 0.05 + 0.03 * Math.sin(timeNow * 0.4 + ray * 1.7);
+      const rayGrad = ctx.createLinearGradient(topX, 0, topX + tilt, H);
+      rayGrad.addColorStop(0, 'rgba(120,200,240,' + (shine * a) + ')');
+      rayGrad.addColorStop(1, 'rgba(120,200,240,0)');
+      ctx.fillStyle = rayGrad;
+      ctx.beginPath();
+      ctx.moveTo(topX - width, 0);
+      ctx.lineTo(topX + width, 0);
+      ctx.lineTo(topX + tilt + width * 2.6, H);
+      ctx.lineTo(topX + tilt - width * 2.6, H);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // marine snow
+    for (let i = 0; i < 110; i++) {
+      const sx = ((i * 97.3) % W) + Math.sin(timeNow * 0.5 + i) * 14;
+      const sy = ((i * 53.7) + timeNow * (6 + (i % 5) * 3.5)) % H;
+      ctx.fillStyle = 'rgba(180,210,230,' + ((0.10 + (i % 3) * 0.05) * a) + ')';
+      ctx.fillRect(sx, sy, 1.4, 1.4);
+    }
+
     const light = ctx.createRadialGradient(mouse.x, mouse.y, 0, mouse.x, mouse.y, 240);
     light.addColorStop(0, 'rgba(140,210,255,' + (0.13 * a) + ')');
     light.addColorStop(1, 'rgba(140,210,255,0)');
@@ -1841,6 +2052,19 @@ const stationUndertow = {
       ctx.arc(j.x, j.y, bellR, Math.PI, 0);
       ctx.closePath();
       ctx.fill();
+      // bright nucleus + radial gills inside the bell
+      ctx.fillStyle = 'hsla(' + j.hue.toFixed(0) + ',95%,82%,' + (0.5 * glow * a).toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.arc(j.x, j.y - bellR * 0.35, bellR * 0.3, 0, TAU);
+      ctx.fill();
+      ctx.strokeStyle = 'hsla(' + j.hue.toFixed(0) + ',90%,75%,' + (0.30 * glow * a).toFixed(3) + ')';
+      ctx.lineWidth = 1;
+      for (let gill = -2; gill <= 2; gill++) {
+        ctx.beginPath();
+        ctx.moveTo(j.x, j.y - bellR * 0.3);
+        ctx.lineTo(j.x + gill * bellR * 0.32, j.y - 1);
+        ctx.stroke();
+      }
       ctx.strokeStyle = 'hsla(' + j.hue.toFixed(0) + ',85%,72%,' + (0.35 * glow * a).toFixed(3) + ')';
       ctx.lineWidth = 1.2;
       for (let t = 0; t < 5; t++) {
@@ -1885,6 +2109,29 @@ const stationEye = {
         x: Math.random() * W, y: Math.random() * H,
         vx: 0, vy: 0,
       });
+    }
+    this.fibers = [];
+    for (let i = 0; i < 160; i++) {
+      this.fibers.push({
+        ang: (i / 160) * TAU + rand(-0.02, 0.02),
+        hueJ: rand(-16, 22),
+        inJ: rand(0, 0.16),
+        outJ: rand(0.82, 1.0),
+        alpha: rand(0.25, 0.7),
+        width: rand(0.8, 2.2),
+      });
+    }
+    this.veins = [];
+    for (let i = 0; i < 9; i++) {
+      const startAng = rand(0, TAU);
+      const pts = [];
+      let ang = startAng, radK = rand(1.55, 1.85);
+      for (let s = 0; s < 7; s++) {
+        pts.push({ ang, radK });
+        ang += rand(-0.16, 0.16);
+        radK -= rand(0.06, 0.12);
+      }
+      this.veins.push(pts);
     }
     this.extraEyes = [
       { fx: 0.12, fy: 0.18, r: 26, opensAt: 25, lid: 1, blinkT: rand(2, 5) },
@@ -1978,33 +2225,155 @@ const stationEye = {
 
   draw(a) {
     const cx = W / 2, cy = H / 2;
-    const eyeRadius = Math.min(W, H) * 0.24;
+    const R = Math.min(W, H) * 0.24;
+    const toMouseX = mouse.x - cx, toMouseY = mouse.y - cy;
+    const mouseDist = Math.hypot(toMouseX, toMouseY) + 0.001;
+    const lookMag = Math.min(mouseDist, R * 0.32);
+    const lookX = (toMouseX / mouseDist) * lookMag;
+    const lookY = (toMouseY / mouseDist) * lookMag;
+    const proximity = clamp(1 - mouseDist / (R * 2.5), 0, 1);
+    const pupilR = R * (0.26 + proximity * 0.22);
+    const ix = cx + lookX, iy = cy + lookY;
+
     ctx.save();
     ctx.globalAlpha = a;
-    const bg = ctx.createRadialGradient(cx, cy, eyeRadius * 0.2, cx, cy, Math.max(W, H) * 0.7);
-    bg.addColorStop(0, 'rgba(40,4,8,' + (0.9 * a) + ')');
+
+    const bg = ctx.createRadialGradient(cx, cy, R * 0.2, cx, cy, Math.max(W, H) * 0.7);
+    bg.addColorStop(0, 'rgba(38,5,9,' + (0.9 * a) + ')');
     bg.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = bg;
     ctx.fillRect(0, 0, W, H);
 
+    // sclera
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(1.85, 1.12);
+    const sclera = ctx.createRadialGradient(0, 0, 0, 0, 0, R);
+    sclera.addColorStop(0, 'rgba(126,108,104,' + (0.95 * a) + ')');
+    sclera.addColorStop(0.72, 'rgba(96,72,70,' + (0.92 * a) + ')');
+    sclera.addColorStop(1, 'rgba(46,18,20,' + (0.85 * a) + ')');
+    ctx.fillStyle = sclera;
+    ctx.beginPath();
+    ctx.arc(0, 0, R, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+
+    // veins crawling in from the edges
+    ctx.lineWidth = 1.3;
+    for (const vein of this.veins) {
+      ctx.strokeStyle = 'rgba(168,42,40,' + ((0.22 + proximity * 0.25) * a) + ')';
+      ctx.beginPath();
+      for (let s = 0; s < vein.length; s++) {
+        const pt = vein[s];
+        const vx = cx + Math.cos(pt.ang) * R * pt.radK * 1.5;
+        const vy = cy + Math.sin(pt.ang) * R * pt.radK * 0.78;
+        if (s === 0) ctx.moveTo(vx, vy); else ctx.lineTo(vx, vy);
+      }
+      ctx.stroke();
+    }
+
+    // iris base
+    const irisGrad = ctx.createRadialGradient(ix, iy, pupilR * 0.6, ix, iy, R);
+    irisGrad.addColorStop(0, 'rgba(150,86,20,' + (0.95 * a) + ')');
+    irisGrad.addColorStop(0.55, 'rgba(108,72,22,' + (0.95 * a) + ')');
+    irisGrad.addColorStop(0.85, 'rgba(52,60,34,' + (0.95 * a) + ')');
+    irisGrad.addColorStop(1, 'rgba(16,14,10,' + (0.98 * a) + ')');
+    ctx.fillStyle = irisGrad;
+    ctx.beginPath();
+    ctx.arc(ix, iy, R, 0, TAU);
+    ctx.fill();
+
+    // iris fibers, slowly rotating
+    ctx.save();
+    ctx.translate(ix, iy);
+    const spin = timeNow * 0.03;
+    for (const f of this.fibers) {
+      const ang = f.ang + spin;
+      const r0 = pupilR * (1 + f.inJ);
+      const r1 = pupilR + (R - pupilR) * f.outJ;
+      const hue = 32 + f.hueJ + Math.sin(ang * 3) * 10;
+      ctx.strokeStyle = 'hsla(' + hue.toFixed(0) + ',72%,' + (46 + f.hueJ).toFixed(0) + '%,' + (f.alpha * a).toFixed(3) + ')';
+      ctx.lineWidth = f.width;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(ang) * r0, Math.sin(ang) * r0);
+      ctx.lineTo(Math.cos(ang + 0.05) * r1, Math.sin(ang + 0.05) * r1);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // particle shimmer living inside the iris
     ctx.globalCompositeOperation = 'lighter';
     for (const p of this.particles) {
-      const hue = 18 + Math.sin(p.ang * 5) * 14 + p.rad * 38;
-      ctx.fillStyle = 'hsla(' + hue.toFixed(0) + ',85%,55%,' + (0.5 * a).toFixed(3) + ')';
+      const hue = 26 + Math.sin(p.ang * 5) * 14 + p.rad * 30;
+      ctx.fillStyle = 'hsla(' + hue.toFixed(0) + ',85%,58%,' + (0.28 * a).toFixed(3) + ')';
       ctx.fillRect(p.x, p.y, 2, 2);
     }
-    const toMouseX = mouse.x - cx, toMouseY = mouse.y - cy;
-    const mouseDist = Math.hypot(toMouseX, toMouseY) + 0.001;
-    const lookMag = Math.min(mouseDist, eyeRadius * 0.32);
-    const px = cx + (toMouseX / mouseDist) * lookMag;
-    const py = cy + (toMouseY / mouseDist) * lookMag;
-    const glow = ctx.createRadialGradient(px, py, 0, px, py, eyeRadius * 0.5);
-    glow.addColorStop(0, 'rgba(255,30,30,' + (0.30 * (1 - this.lid) * a) + ')');
-    glow.addColorStop(1, 'rgba(255,30,30,0)');
-    ctx.fillStyle = glow;
-    ctx.fillRect(px - eyeRadius, py - eyeRadius, eyeRadius * 2, eyeRadius * 2);
-
     ctx.globalCompositeOperation = 'source-over';
+
+    // limbal ring
+    ctx.strokeStyle = 'rgba(8,6,4,' + (0.85 * a) + ')';
+    ctx.lineWidth = R * 0.05;
+    ctx.beginPath();
+    ctx.arc(ix, iy, R * 0.97, 0, TAU);
+    ctx.stroke();
+
+    // pupil with soft edge and an ember deep inside
+    const pupilGrad = ctx.createRadialGradient(ix, iy, 0, ix, iy, pupilR);
+    pupilGrad.addColorStop(0, 'rgba(0,0,0,1)');
+    pupilGrad.addColorStop(0.7, 'rgba(0,0,0,1)');
+    pupilGrad.addColorStop(1, 'rgba(20,8,4,' + (0.9 * a) + ')');
+    ctx.fillStyle = pupilGrad;
+    ctx.beginPath();
+    ctx.arc(ix, iy, pupilR, 0, TAU);
+    ctx.fill();
+    const ember = ctx.createRadialGradient(ix, iy, 0, ix, iy, pupilR * 0.55);
+    ember.addColorStop(0, 'rgba(255,40,24,' + ((0.16 + proximity * 0.30) * (1 - this.lid) * a) + ')');
+    ember.addColorStop(1, 'rgba(255,40,24,0)');
+    ctx.fillStyle = ember;
+    ctx.beginPath();
+    ctx.arc(ix, iy, pupilR * 0.55, 0, TAU);
+    ctx.fill();
+
+    // specular glints
+    ctx.fillStyle = 'rgba(255,252,244,' + (0.85 * (1 - this.lid) * a) + ')';
+    ctx.beginPath();
+    ctx.arc(ix - pupilR * 0.45, iy - pupilR * 0.5, R * 0.045, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,252,244,' + (0.4 * (1 - this.lid) * a) + ')';
+    ctx.beginPath();
+    ctx.arc(ix + pupilR * 0.55, iy + pupilR * 0.42, R * 0.022, 0, TAU);
+    ctx.fill();
+
+    // eyelids
+    const aperture = R * 1.06 * (1 - this.lid * 0.97);
+    const lidColor = 'rgba(7,3,5,' + (0.99 * a) + ')';
+    ctx.fillStyle = lidColor;
+    ctx.beginPath();
+    ctx.moveTo(cx - R * 2.1, cy - R * 1.5);
+    ctx.lineTo(cx - R * 2.1, cy - aperture * 0.45);
+    ctx.quadraticCurveTo(cx, cy - aperture, cx + R * 2.1, cy - aperture * 0.45);
+    ctx.lineTo(cx + R * 2.1, cy - R * 1.5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(cx - R * 2.1, cy + R * 1.5);
+    ctx.lineTo(cx - R * 2.1, cy + aperture * 0.45);
+    ctx.quadraticCurveTo(cx, cy + aperture, cx + R * 2.1, cy + aperture * 0.45);
+    ctx.lineTo(cx + R * 2.1, cy + R * 1.5);
+    ctx.closePath();
+    ctx.fill();
+    // lash lines along the lid edges
+    ctx.strokeStyle = 'rgba(120,60,52,' + (0.5 * a) + ')';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx - R * 1.6, cy - aperture * 0.42);
+    ctx.quadraticCurveTo(cx, cy - aperture * 0.97, cx + R * 1.6, cy - aperture * 0.42);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - R * 1.6, cy + aperture * 0.42);
+    ctx.quadraticCurveTo(cx, cy + aperture * 0.97, cx + R * 1.6, cy + aperture * 0.42);
+    ctx.stroke();
+
     for (const ex of this.extraEyes) {
       if (this.watchTime > ex.opensAt) this.drawSmallEye(ex, a);
     }
@@ -2314,6 +2683,29 @@ function drawUI(maxSignal) {
     ctx.textAlign = 'left';
   }
 
+  // ---- click ripples: every click visibly lands, everywhere
+  for (let i = clickRipples.length - 1; i >= 0; i--) {
+    const r = clickRipples[i];
+    r.t += 0.016;
+    if (r.t > 0.5) { clickRipples.splice(i, 1); continue; }
+    const k = r.t / 0.5;
+    ctx.strokeStyle = 'rgba(220,255,230,' + ((1 - k) * 0.8) + ')';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, 6 + k * 30, 0, TAU);
+    ctx.stroke();
+  }
+
+  // ---- dead click: clicked into pure static
+  if (deadClick && timeNow - deadClick.born < 1.4) {
+    const k = (timeNow - deadClick.born) / 1.4;
+    ctx.font = '17px "VT323", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(170,200,180,' + ((1 - k) * 0.7) + ')';
+    ctx.fillText('just static here. keep tuning.', deadClick.x, deadClick.y - 24 - k * 14);
+    ctx.textAlign = 'left';
+  }
+
   // ---- custom cursor
   ctx.strokeStyle = 'rgba(200,255,215,0.85)';
   ctx.lineWidth = 1.2;
@@ -2328,11 +2720,19 @@ function drawUI(maxSignal) {
 
 // ---------------------------------------------------------------- main loop
 
+let bloomCanvas = null, bloomCtx = null;
+
 function resize() {
   W = innerWidth; H = innerHeight;
   screenEl.width = Math.round(W * dpr);
   screenEl.height = Math.round(H * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (typeof ctx.filter === 'string') {
+    bloomCanvas = document.createElement('canvas');
+    bloomCanvas.width = Math.max(1, W >> 2);
+    bloomCanvas.height = Math.max(1, H >> 2);
+    bloomCtx = bloomCanvas.getContext('2d');
+  }
   for (const st of STATIONS) st.resize();
 }
 addEventListener('resize', resize);
@@ -2395,13 +2795,33 @@ function frame(now) {
   }
   const noiseLevel = clamp(1 - maxSignal, 0, 1) * 0.96 + 0.04;
 
-  for (const st of STATIONS) if (st.signal > 0.02) st.update(dt);
+  for (const st of STATIONS) {
+    if (st.signal <= 0.02) continue;
+    try { st.update(dt); } catch (e) {}
+  }
 
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, W, H);
 
   const ordered = [...STATIONS].sort((a, b) => a.signal - b.signal);
-  for (const st of ordered) if (st.signal > 0.02) st.draw(st.signal);
+  for (const st of ordered) {
+    if (st.signal <= 0.02) continue;
+    ctx.save();
+    try { st.draw(st.signal); } catch (e) {}
+    ctx.restore();
+  }
+
+  // bloom post-pass: quarter-res additive blur over everything drawn so far
+  if (bloomCtx && maxSignal > 0.05) {
+    bloomCtx.globalCompositeOperation = 'copy';
+    bloomCtx.drawImage(screenEl, 0, 0, bloomCanvas.width, bloomCanvas.height);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.40 * maxSignal;
+    ctx.filter = 'blur(7px)';
+    ctx.drawImage(bloomCanvas, 0, 0, W, H);
+    ctx.restore();
+  }
 
   drawGlyphEvent(maxSignal);
   drawStatic(noiseLevel * (0.25 + 0.75 * (1 - maxSignal)));
