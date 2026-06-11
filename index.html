@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>NIGHTDIAL — 87.0 to 108.0</title>
-<meta name="description" content="A radio for the frequencies between frequencies. Six stations are hiding in the static.">
+<meta name="description" content="A radio for the frequencies between frequencies. Eleven stations are hiding in the static. Some say there are more.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
-  body { font-family: "VT323", monospace; cursor: crosshair; }
+  body { font-family: "VT323", monospace; cursor: none; }
   canvas#screen { position: fixed; inset: 0; display: block; }
 
   #crt { position: fixed; inset: 0; pointer-events: none; z-index: 5;
@@ -61,7 +61,7 @@
 <div id="intro">
   <h1>NIGHTDIAL</h1>
   <p>a radio for the frequencies between frequencies.</p>
-  <p>six stations are hiding in the static. find them.</p>
+  <p>eleven stations are hiding in the static. some say there are more.</p>
   <div class="power">[ CLICK TO POWER ON — SOUND RECOMMENDED ]</div>
   <div class="fine">scroll to tune &nbsp;·&nbsp; space to scan &nbsp;·&nbsp; the dial remembers what you find</div>
 </div>
@@ -70,8 +70,8 @@
 'use strict';
 
 const TAU = Math.PI * 2;
-const screen = document.getElementById('screen');
-const ctx = screen.getContext('2d');
+const screenEl = document.getElementById('screen');
+const ctx = screenEl.getContext('2d');
 const dpr = Math.min(window.devicePixelRatio || 1, 1.75);
 let W = 0, H = 0;
 
@@ -90,19 +90,39 @@ let started = false;
 let bootAt = 0;
 let timeNow = 0;
 let muted = false;
+let lastInput = performance.now();
+let idleTarget = null;
+let lastHash = '';
+let lastTitle = '';
+let glyphEvent = null;
 
 const toasts = [];
 function toast(text) { toasts.push({ text, born: timeNow }); }
 
 let foundSet = new Set();
-try { foundSet = new Set(JSON.parse(localStorage.getItem('nightdial_found') || '[]')); } catch (e) {}
+let seenBroadcast = false;
+try {
+  foundSet = new Set(JSON.parse(localStorage.getItem('nightdial_found') || '[]'));
+  seenBroadcast = localStorage.getItem('nightdial_broadcast') === '1';
+} catch (e) {}
 function persistFound() {
   try { localStorage.setItem('nightdial_found', JSON.stringify([...foundSet])); } catch (e) {}
 }
 
+function visibleFoundCount() {
+  let n = 0;
+  for (const st of STATIONS) if (!st.hidden && foundSet.has(st.f)) n++;
+  return n;
+}
+function totalVisible() {
+  let n = 0;
+  for (const st of STATIONS) if (!st.hidden) n++;
+  return n;
+}
+
 // ---------------------------------------------------------------- input
 
-const mouse = { x: innerWidth / 2, y: innerHeight / 2, down: false, speed: 0, lastMove: 0, lastT: 0 };
+const mouse = { x: innerWidth / 2, y: innerHeight / 2, down: false, speed: 0, dxs: 0, lastMove: 0, lastT: 0 };
 let dialDragging = false;
 
 function dialZone(y) { return y > H - 96; }
@@ -114,14 +134,17 @@ addEventListener('pointermove', e => {
   const dt = Math.max(1, now - mouse.lastT);
   const instSpeed = Math.hypot(e.clientX - mouse.x, e.clientY - mouse.y) / dt * 1000;
   mouse.speed = lerp(mouse.speed, instSpeed, 0.3);
+  mouse.dxs = lerp(mouse.dxs, e.clientX - mouse.x, 0.2);
   mouse.x = e.clientX; mouse.y = e.clientY;
   mouse.lastT = now; mouse.lastMove = now;
+  lastInput = now;
   if (dialDragging) targetFreq = xToFreq(e.clientX);
 });
 
 addEventListener('pointerdown', e => {
   mouse.x = e.clientX; mouse.y = e.clientY;
   mouse.down = true;
+  lastInput = performance.now();
   if (!started) return;
   if (dialZone(e.clientY)) { dialDragging = true; targetFreq = xToFreq(e.clientX); return; }
   const st = strongestStation();
@@ -133,6 +156,7 @@ addEventListener('pointerup', () => { mouse.down = false; dialDragging = false; 
 addEventListener('wheel', e => {
   if (!started) return;
   e.preventDefault();
+  lastInput = performance.now();
   targetFreq = clamp(targetFreq + e.deltaY * 0.0021, FREQ_MIN, FREQ_MAX);
 }, { passive: false });
 
@@ -144,8 +168,8 @@ function scanToNext() {
 
 addEventListener('keydown', e => {
   if (!started) return;
-  const ghost = STATIONS.find(s => s.id === 'ghost');
-  const ghostActive = ghost.signal > 0.5;
+  lastInput = performance.now();
+  const ghostActive = stationGhost.signal > 0.5;
 
   if (e.key === 'ArrowLeft') { e.preventDefault(); targetFreq = clamp(targetFreq - 0.1, FREQ_MIN, FREQ_MAX); return; }
   if (e.key === 'ArrowRight') { e.preventDefault(); targetFreq = clamp(targetFreq + 0.1, FREQ_MIN, FREQ_MAX); return; }
@@ -153,15 +177,17 @@ addEventListener('keydown', e => {
   if (ghostActive) {
     if (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Enter') {
       e.preventDefault();
-      ghost.onKey(e.key);
+      stationGhost.onKey(e.key);
       return;
     }
   }
+  if (stationNumbers.signal > 0.5 && /^[0-9]$/.test(e.key)) { stationNumbers.parrot(e.key); return; }
+  if (stationBloom.signal > 0.5 && (e.key === 'g' || e.key === 'G')) { stationBloom.gliderGun(mouse.x, mouse.y); toast('GLIDER GUN PLANTED'); return; }
+  if (stationBloom.signal > 0.5 && (e.key === 'r' || e.key === 'R')) { stationBloom.reseed(); toast('GARDEN RESEEDED'); return; }
   if (e.key === ' ') { e.preventDefault(); scanToNext(); return; }
-  if (e.key === 'm' || e.key === 'M') { muted = !muted; toast(muted ? 'AUDIO MUTED' : 'AUDIO ON'); return; }
+  if (e.key === 'm' || e.key === 'M') { muted = !muted; if (muted) try { speechSynthesis.cancel(); } catch (err) {} toast(muted ? 'AUDIO MUTED' : 'AUDIO ON'); return; }
   if (e.key === 'c' || e.key === 'C') {
-    const sky = STATIONS.find(s => s.id === 'sky');
-    if (sky.signal > 0.5) { sky.clearSky(); toast('SKY CLEARED'); }
+    if (stationSky.signal > 0.5) { stationSky.clearSky(); toast('SKY CLEARED'); }
   }
 });
 
@@ -170,19 +196,24 @@ addEventListener('keydown', e => {
 let AC = null, masterGain = null, noiseGainNode = null;
 let masterLevel = 0, noiseLevelSmooth = 0;
 
-function buildVoice(destination, type, frequency, cutoff, level) {
+function buildVoice(destination, v) {
   const osc = AC.createOscillator();
-  osc.type = type;
-  osc.frequency.value = frequency;
+  osc.type = v.type;
+  osc.frequency.value = v.f;
   const filter = AC.createBiquadFilter();
   filter.type = 'lowpass';
-  filter.frequency.value = cutoff;
+  filter.frequency.value = v.cut;
   const voiceGain = AC.createGain();
-  voiceGain.gain.value = level;
+  voiceGain.gain.value = v.lvl;
   const lfo = AC.createOscillator();
-  lfo.frequency.value = rand(0.05, 0.22);
   const lfoGain = AC.createGain();
-  lfoGain.gain.value = rand(3, 9);
+  if (v.vib) {
+    lfo.frequency.value = v.vib.rate;
+    lfoGain.gain.value = v.vib.depth;
+  } else {
+    lfo.frequency.value = rand(0.05, 0.22);
+    lfoGain.gain.value = rand(3, 9);
+  }
   lfo.connect(lfoGain).connect(osc.detune);
   osc.connect(filter).connect(voiceGain).connect(destination);
   osc.start(); lfo.start();
@@ -216,8 +247,43 @@ function initAudio() {
     st.gainNode.gain.value = 0;
     st.gainNode.connect(masterGain);
     st.gainSmooth = 0;
-    for (const v of st.voices) buildVoice(st.gainNode, v.type, v.f, v.cut, v.lvl);
+    for (const v of st.voices) buildVoice(st.gainNode, v);
   }
+}
+
+function blipAt(offset, f, dur, type, vol, glideTo) {
+  if (!AC || muted) return;
+  try {
+    const t0 = AC.currentTime + offset;
+    const osc = AC.createOscillator();
+    const g = AC.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.setValueAtTime(f, t0);
+    if (glideTo) osc.frequency.exponentialRampToValueAtTime(Math.max(1, glideTo), t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(g).connect(masterGain);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.05);
+  } catch (e) {}
+}
+function blip(f, dur, type, vol, glideTo) { blipAt(0, f, dur, type, vol, glideTo); }
+
+function discoveryJingle() {
+  blipAt(0, 523.25, 0.22, 'triangle', 0.10);
+  blipAt(0.09, 659.25, 0.22, 'triangle', 0.10);
+  blipAt(0.18, 783.99, 0.34, 'triangle', 0.10);
+}
+
+const DIGIT_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
+function speak(text, volume) {
+  if (muted || !('speechSynthesis' in window)) return;
+  try {
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 0.7; u.pitch = 0.4; u.volume = clamp(volume, 0, 1);
+    speechSynthesis.speak(u);
+  } catch (e) {}
 }
 
 function updateAudio(dt, noiseLevel) {
@@ -272,10 +338,29 @@ function drawStatic(level) {
   ctx.restore();
 }
 
+function drawGlyphEvent(maxSignal) {
+  if (!glyphEvent && maxSignal < 0.35 && Math.random() < 0.00022) {
+    const allFound = visibleFoundCount() === totalVisible();
+    const char = (allFound && !seenBroadcast) ? '100.0' : pick(['◉', '▲', '?', '※', 'TUNE', 'STAY']);
+    glyphEvent = { char, until: timeNow + 3 };
+  }
+  if (!glyphEvent) return;
+  if (timeNow > glyphEvent.until || maxSignal > 0.5) { glyphEvent = null; return; }
+  ctx.save();
+  ctx.globalAlpha = 0.07 + 0.05 * Math.sin(timeNow * 31);
+  ctx.fillStyle = '#cfe8d6';
+  ctx.font = Math.round(H * 0.42) + 'px "VT323", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(glyphEvent.char, W / 2, H / 2);
+  ctx.restore();
+}
+
 // ================================================================ STATIONS
 
 // ------------------------------------------------ 88.3 THE RAIN
 const RAIN_GLYPHS = 'アイウエオカキクケコサシスセソタチツテトナニヌネノ0123456789$#%&@ZX';
+const RAIN_WORDS = ['STAY', 'TUNE', 'LISTEN', 'OPERATOR', '1987', 'SIGNAL', 'BELOW', 'AGAIN'];
 const stationRain = {
   id: 'rain', f: 88.3, name: 'THE RAIN', sub: 'it remembers being code',
   hint: 'it is afraid of your cursor. click to scatter it.',
@@ -294,11 +379,12 @@ const stationRain = {
       this.streams.push({
         col: i, y: rand(-H, H), sp: rand(130, 380), len: (rand(8, 22)) | 0,
         xoff: 0, xv: 0, seed: (Math.random() * 1000) | 0,
+        word: Math.random() < 0.05 ? pick(RAIN_WORDS) : null,
       });
     }
   },
 
-  onClick(x, y) { this.shock = { x, y, t: 0 }; },
+  onClick(x, y) { this.shock = { x, y, t: 0 }; blip(140, 0.4, 'sawtooth', 0.10, 50); },
 
   update(dt) {
     if (this.shock) {
@@ -335,6 +421,7 @@ const stationRain = {
         s.sp = rand(130, 380);
         s.len = (rand(8, 22)) | 0;
         s.seed = (Math.random() * 1000) | 0;
+        s.word = Math.random() < 0.05 ? pick(RAIN_WORDS) : null;
       }
     }
   },
@@ -350,24 +437,161 @@ const stationRain = {
       for (let i = 0; i < s.len; i++) {
         const y = s.y - i * this.cs;
         if (y < -this.cs || y > H) continue;
-        const gi = (s.seed + s.col * 31 + ((y / this.cs) | 0) * 7 + ((flick + i) % 3 === 0 ? flick : 0)) % RAIN_GLYPHS.length;
+        let ch;
+        if (s.word && i > 0 && i <= s.word.length) {
+          ch = s.word[s.word.length - i];
+        } else {
+          const gi = (s.seed + s.col * 31 + ((y / this.cs) | 0) * 7 + ((flick + i) % 3 === 0 ? flick : 0)) % RAIN_GLYPHS.length;
+          ch = RAIN_GLYPHS[Math.abs(gi)];
+        }
         const fade = 1 - i / s.len;
         if (i === 0) {
           ctx.fillStyle = 'rgba(220,255,230,' + (0.95 * a) + ')';
+        } else if (s.word && i <= s.word.length) {
+          ctx.fillStyle = 'rgba(190,255,255,' + (fade * 0.95 * a).toFixed(3) + ')';
         } else {
           ctx.fillStyle = 'rgba(40,255,110,' + (fade * 0.85 * a).toFixed(3) + ')';
         }
-        ctx.fillText(RAIN_GLYPHS[Math.abs(gi)], x, y);
+        ctx.fillText(ch, x, y);
       }
     }
     ctx.restore();
   },
 };
 
+// ------------------------------------------------ 89.9 EMBER (fire)
+const stationEmber = {
+  id: 'ember', f: 89.9, name: 'EMBER', sub: 'you are the torch',
+  hint: 'your cursor burns. click to detonate. wind follows your hand.',
+  audioLevel: 0.11,
+  voices: [
+    { type: 'sawtooth', f: 58, cut: 180, lvl: 0.5 },
+    { type: 'sawtooth', f: 87, cut: 220, lvl: 0.25 },
+  ],
+  signal: 0, scale: 6, fw: 0, fh: 0, heat: null, palette: null,
+  fireCanvas: null, fireCtx: null, fireImage: null, sparks: [],
+
+  resize() {
+    this.fw = Math.ceil(W / this.scale);
+    this.fh = Math.ceil(H / this.scale) + 2;
+    this.heat = new Uint8Array(this.fw * this.fh);
+    this.fireCanvas = document.createElement('canvas');
+    this.fireCanvas.width = this.fw; this.fireCanvas.height = this.fh;
+    this.fireCtx = this.fireCanvas.getContext('2d');
+    this.fireImage = this.fireCtx.createImageData(this.fw, this.fh);
+    this.sparks = [];
+    if (!this.palette) {
+      const stops = [
+        [0, 0, 0, 0], [10, 70, 12, 4], [16, 165, 45, 8], [22, 235, 115, 16],
+        [28, 255, 185, 45], [33, 255, 235, 140], [36, 255, 255, 230],
+      ];
+      this.palette = [];
+      for (let i = 0; i <= 36; i++) {
+        let lo = stops[0], hi = stops[stops.length - 1];
+        for (let s = 0; s < stops.length - 1; s++) {
+          if (i >= stops[s][0] && i <= stops[s + 1][0]) { lo = stops[s]; hi = stops[s + 1]; break; }
+        }
+        const k = (i - lo[0]) / Math.max(1, hi[0] - lo[0]);
+        this.palette.push([
+          Math.round(lerp(lo[1], hi[1], k)),
+          Math.round(lerp(lo[2], hi[2], k)),
+          Math.round(lerp(lo[3], hi[3], k)),
+        ]);
+      }
+    }
+  },
+
+  onClick(x, y) {
+    const cx = (x / this.scale) | 0, cy = (y / this.scale) | 0;
+    for (let oy = -6; oy <= 6; oy++) {
+      for (let ox = -6; ox <= 6; ox++) {
+        if (ox * ox + oy * oy > 40) continue;
+        const gx = clamp(cx + ox, 0, this.fw - 1), gy = clamp(cy + oy, 0, this.fh - 1);
+        this.heat[gy * this.fw + gx] = 36;
+      }
+    }
+    for (let i = 0; i < 36; i++) {
+      this.sparks.push({ x, y, vx: rand(-260, 260), vy: rand(-420, -60), life: rand(0.5, 1.4) });
+    }
+    blip(70, 0.5, 'sawtooth', 0.14, 28);
+  },
+
+  update(dt) {
+    const { fw, fh, heat } = this;
+    for (let x = 0; x < fw; x++) heat[(fh - 1) * fw + x] = 30 + ((Math.random() * 7) | 0);
+
+    if (!dialZone(mouse.y)) {
+      const cx = (mouse.x / this.scale) | 0, cy = (mouse.y / this.scale) | 0;
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const gx = clamp(cx + ox, 0, fw - 1), gy = clamp(cy + oy, 0, fh - 1);
+          heat[gy * fw + gx] = 36;
+        }
+      }
+    }
+
+    const wind = clamp(mouse.dxs * 0.12, -1, 1);
+    for (let y = 1; y < fh; y++) {
+      const rowSrc = y * fw, rowDst = (y - 1) * fw;
+      for (let x = 0; x < fw; x++) {
+        const src = heat[rowSrc + x];
+        let dx = x + (((Math.random() * 3) | 0) - 1);
+        if (Math.random() < Math.abs(wind)) dx += wind > 0 ? 1 : -1;
+        if (dx < 0) dx = 0; else if (dx >= fw) dx = fw - 1;
+        const decay = (Math.random() * 2.4) | 0;
+        heat[rowDst + dx] = src > decay ? src - decay : 0;
+      }
+    }
+
+    for (let i = this.sparks.length - 1; i >= 0; i--) {
+      const sp = this.sparks[i];
+      sp.life -= dt;
+      sp.vy += 460 * dt;
+      sp.x += sp.vx * dt;
+      sp.y += sp.vy * dt;
+      if (sp.life <= 0) this.sparks.splice(i, 1);
+    }
+
+    if (this.signal > 0.5 && Math.random() < dt * 7) {
+      blip(rand(900, 3200), 0.025, 'square', 0.035);
+    }
+  },
+
+  draw(a) {
+    const px = this.fireImage.data;
+    const { heat, palette } = this;
+    for (let i = 0; i < heat.length; i++) {
+      const h = heat[i];
+      const o = i * 4;
+      if (h === 0) { px[o + 3] = 0; continue; }
+      const c = palette[h];
+      px[o] = c[0]; px[o + 1] = c[1]; px[o + 2] = c[2];
+      px[o + 3] = Math.min(255, h * 34);
+    }
+    this.fireCtx.putImageData(this.fireImage, 0, 0);
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(this.fireCanvas, 0, 0, W, H + this.scale * 2);
+    ctx.globalCompositeOperation = 'lighter';
+    for (const sp of this.sparks) {
+      ctx.fillStyle = 'rgba(255,210,110,' + (clamp(sp.life, 0, 1) * a).toFixed(3) + ')';
+      ctx.fillRect(sp.x, sp.y, 2.5, 2.5);
+    }
+    ctx.restore();
+  },
+};
+
 // ------------------------------------------------ 91.7 BLOOM (Game of Life)
+const GLIDER_GUN = [
+  [24,0],[22,1],[24,1],[12,2],[13,2],[20,2],[21,2],[34,2],[35,2],
+  [11,3],[15,3],[20,3],[21,3],[34,3],[35,3],[0,4],[1,4],[10,4],[16,4],[20,4],[21,4],
+  [0,5],[1,5],[10,5],[14,5],[16,5],[17,5],[22,5],[24,5],[10,6],[16,6],[24,6],
+  [11,7],[15,7],[12,8],[13,8],
+];
 const stationBloom = {
   id: 'bloom', f: 91.7, name: 'BLOOM', sub: 'a garden playing itself',
-  hint: 'paint with your cursor. life does the rest.',
+  hint: 'paint with your cursor. [g] glider gun. [r] reseed.',
   audioLevel: 0.07,
   voices: [
     { type: 'sine', f: 220, cut: 1200, lvl: 0.30 },
@@ -387,11 +611,28 @@ const stationBloom = {
     this.next = new Uint8Array(n);
     this.age = new Uint16Array(n);
     this.energy = new Float32Array(n);
-    for (let i = 0; i < n; i++) this.grid[i] = Math.random() < 0.10 ? 1 : 0;
+    this.reseed();
     this.lifeCanvas = document.createElement('canvas');
     this.lifeCanvas.width = this.cols; this.lifeCanvas.height = this.rows;
     this.lifeCtx = this.lifeCanvas.getContext('2d');
     this.lifeImage = this.lifeCtx.createImageData(this.cols, this.rows);
+  },
+
+  reseed() {
+    for (let i = 0; i < this.grid.length; i++) {
+      this.grid[i] = Math.random() < 0.10 ? 1 : 0;
+      this.age[i] = 0;
+    }
+  },
+
+  gliderGun(x, y) {
+    const cx = (x / this.cell) | 0, cy = (y / this.cell) | 0;
+    for (const [ox, oy] of GLIDER_GUN) {
+      const gx = (cx + ox + this.cols) % this.cols;
+      const gy = (cy + oy + this.rows) % this.rows;
+      this.grid[gy * this.cols + gx] = 1;
+    }
+    blip(660, 0.15, 'triangle', 0.08);
   },
 
   paint(x, y) {
@@ -407,7 +648,7 @@ const stationBloom = {
     }
   },
 
-  onClick(x, y) { this.paint(x, y); },
+  onClick(x, y) { this.paint(x, y); blip(rand(400, 700), 0.07, 'sine', 0.05); },
 
   step() {
     const { cols, rows, grid, next, age } = this;
@@ -481,17 +722,192 @@ const stationBloom = {
   },
 };
 
+// ------------------------------------------------ 93.3 SWARM (evolving creatures)
+const stationSwarm = {
+  id: 'swarm', f: 93.3, name: 'SWARM', sub: 'they learn how you move',
+  hint: 'move gently and they trust you. click to feed them.',
+  audioLevel: 0.07,
+  voices: [
+    { type: 'sine', f: 174.6, cut: 900, lvl: 0.25 },
+    { type: 'sine', f: 233.1, cut: 900, lvl: 0.18 },
+    { type: 'triangle', f: 87.3, cut: 400, lvl: 0.25 },
+  ],
+  signal: 0, creatures: [], pellets: [], temperament: 0, evolveTimer: 7,
+
+  makeCreature(genes, x, y) {
+    return {
+      x: x !== undefined ? x : rand(0, W),
+      y: y !== undefined ? y : rand(0, H),
+      vx: rand(-30, 30), vy: rand(-30, 30),
+      genes: genes || {
+        hue: rand(0, 360), size: rand(2, 5), tailLen: (rand(7, 24)) | 0,
+        maxSpeed: rand(50, 240), twitch: rand(0, 0.9),
+      },
+      tail: [], avgDist: 600,
+    };
+  },
+
+  mutate(genes) {
+    return {
+      hue: (genes.hue + rand(-30, 30) + 360) % 360,
+      size: clamp(genes.size + rand(-0.6, 0.6), 1.5, 7),
+      tailLen: clamp((genes.tailLen + rand(-4, 4)) | 0, 4, 30),
+      maxSpeed: clamp(genes.maxSpeed + rand(-40, 40), 30, 320),
+      twitch: clamp(genes.twitch + rand(-0.2, 0.2), 0, 1.4),
+    };
+  },
+
+  resize() {
+    this.creatures = [];
+    for (let i = 0; i < 55; i++) this.creatures.push(this.makeCreature());
+    this.pellets = [];
+  },
+
+  onClick(x, y) {
+    if (this.pellets.length >= 6) this.pellets.shift();
+    this.pellets.push({ x, y, r: 5 });
+    blip(rand(500, 640), 0.1, 'sine', 0.06);
+  },
+
+  update(dt) {
+    this.temperament = lerp(this.temperament, mouse.speed, Math.min(1, dt * 0.5));
+    const calm = this.temperament < 260;
+    const cs = this.creatures;
+
+    for (const c of cs) {
+      let ax = 0, ay = 0;
+      let nx = 0, ny = 0, nvx = 0, nvy = 0, count = 0;
+      for (const o of cs) {
+        if (o === c) continue;
+        const d2 = dist2(c.x, c.y, o.x, o.y);
+        if (d2 < 90 * 90) {
+          count++;
+          nx += o.x; ny += o.y; nvx += o.vx; nvy += o.vy;
+          if (d2 < 26 * 26) {
+            const d = Math.sqrt(d2) + 0.1;
+            ax += (c.x - o.x) / d * 80;
+            ay += (c.y - o.y) / d * 80;
+          }
+        }
+      }
+      if (count) {
+        ax += ((nx / count) - c.x) * 0.6;
+        ay += ((ny / count) - c.y) * 0.6;
+        ax += ((nvx / count) - c.vx) * 0.8;
+        ay += ((nvy / count) - c.vy) * 0.8;
+      }
+
+      const md = Math.sqrt(dist2(c.x, c.y, mouse.x, mouse.y));
+      c.avgDist = lerp(c.avgDist, md, Math.min(1, dt * 0.8));
+      if (md < 260) {
+        const dirX = (mouse.x - c.x) / (md + 1), dirY = (mouse.y - c.y) / (md + 1);
+        if (calm) { ax += dirX * 60; ay += dirY * 60; }
+        else { ax -= dirX * 220; ay -= dirY * 220; }
+      }
+
+      let nearest = null, nd = 300 * 300;
+      for (const p of this.pellets) {
+        const d2 = dist2(c.x, c.y, p.x, p.y);
+        if (d2 < nd) { nd = d2; nearest = p; }
+      }
+      if (nearest) {
+        const d = Math.sqrt(nd) + 1;
+        ax += (nearest.x - c.x) / d * 320;
+        ay += (nearest.y - c.y) / d * 320;
+        if (d < 12) {
+          nearest.r = 0;
+          c.genes.size = clamp(c.genes.size + 0.3, 1.5, 8);
+          if (cs.length < 90) cs.push(this.makeCreature(this.mutate(c.genes), c.x + rand(-10, 10), c.y + rand(-10, 10)));
+          blip(rand(700, 900), 0.08, 'triangle', 0.06);
+        }
+      }
+
+      ax += rand(-1, 1) * c.genes.twitch * 600;
+      ay += rand(-1, 1) * c.genes.twitch * 600;
+
+      c.vx += ax * dt;
+      c.vy += ay * dt;
+      const sp = Math.hypot(c.vx, c.vy);
+      if (sp > c.genes.maxSpeed) {
+        c.vx *= c.genes.maxSpeed / sp;
+        c.vy *= c.genes.maxSpeed / sp;
+      }
+      c.x += c.vx * dt;
+      c.y += c.vy * dt;
+      if (c.x < 0) { c.x = 0; c.vx = Math.abs(c.vx); }
+      if (c.x > W) { c.x = W; c.vx = -Math.abs(c.vx); }
+      if (c.y < 0) { c.y = 0; c.vy = Math.abs(c.vy); }
+      if (c.y > H - 100) { c.y = H - 100; c.vy = -Math.abs(c.vy); }
+
+      c.tail.unshift({ x: c.x, y: c.y });
+      if (c.tail.length > c.genes.tailLen) c.tail.length = c.genes.tailLen;
+    }
+
+    this.pellets = this.pellets.filter(p => p.r > 0);
+
+    this.evolveTimer -= dt;
+    if (this.evolveTimer <= 0 && cs.length > 8) {
+      this.evolveTimer = rand(5, 9);
+      const fitness = c => calm ? -c.avgDist : c.avgDist;
+      let best = cs[0], worst = cs[0];
+      for (const c of cs) {
+        if (fitness(c) > fitness(best)) best = c;
+        if (fitness(c) < fitness(worst)) worst = c;
+      }
+      const idx = cs.indexOf(worst);
+      if (idx >= 0) cs[idx] = this.makeCreature(this.mutate(best.genes), best.x + rand(-20, 20), best.y + rand(-20, 20));
+    }
+  },
+
+  draw(a) {
+    ctx.save();
+    ctx.globalAlpha = a;
+    const calm = this.temperament < 260;
+    ctx.font = '17px "VT323", monospace';
+    ctx.fillStyle = 'rgba(140,200,170,' + (0.45 * a) + ')';
+    ctx.fillText(calm ? 'the swarm is calm.' : 'the swarm is afraid of you.', 28, 128);
+
+    for (const p of this.pellets) {
+      const pulse = 0.6 + 0.4 * Math.sin(timeNow * 6);
+      ctx.fillStyle = 'rgba(255,240,170,' + (pulse * a) + ')';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 4, 0, TAU);
+      ctx.fill();
+    }
+
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    for (const c of this.creatures) {
+      const g = c.genes;
+      for (let i = 0; i < c.tail.length - 1; i++) {
+        const k = 1 - i / c.tail.length;
+        ctx.strokeStyle = 'hsla(' + g.hue.toFixed(0) + ',80%,60%,' + (k * 0.5 * a).toFixed(3) + ')';
+        ctx.lineWidth = g.size * k;
+        ctx.beginPath();
+        ctx.moveTo(c.tail[i].x, c.tail[i].y);
+        ctx.lineTo(c.tail[i + 1].x, c.tail[i + 1].y);
+        ctx.stroke();
+      }
+      ctx.fillStyle = 'hsla(' + g.hue.toFixed(0) + ',90%,72%,' + (0.95 * a) + ')';
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, g.size, 0, TAU);
+      ctx.fill();
+    }
+    ctx.restore();
+  },
+};
+
 // ------------------------------------------------ 95.5 COLLAPSE (gravity wells)
 const stationCollapse = {
   id: 'collapse', f: 95.5, name: 'COLLAPSE', sub: 'everything falls eventually',
-  hint: 'click to place a singularity. it grows as it eats.',
+  hint: 'click to place a singularity. it grows as it eats. they merge.',
   audioLevel: 0.14,
   voices: [
     { type: 'sine', f: 36.7, cut: 200, lvl: 0.6 },
     { type: 'sine', f: 73.4, cut: 300, lvl: 0.3 },
     { type: 'triangle', f: 49, cut: 200, lvl: 0.25 },
   ],
-  signal: 0, particles: [], wells: [], trail: null, trailCtx: null,
+  signal: 0, particles: [], wells: [], shocks: [], trail: null, trailCtx: null,
 
   resize() {
     this.trail = document.createElement('canvas');
@@ -500,6 +916,7 @@ const stationCollapse = {
     this.particles = [];
     for (let i = 0; i < 850; i++) this.particles.push(this.spawn());
     this.wells = [];
+    this.shocks = [];
   },
 
   spawn() {
@@ -522,6 +939,7 @@ const stationCollapse = {
   onClick(x, y) {
     if (this.wells.length >= 4) this.wells.shift();
     this.wells.push({ x, y, m: 1, age: 0, life: rand(16, 26), eaten: 0 });
+    blip(55, 0.6, 'sine', 0.2, 24);
   },
 
   update(dt) {
@@ -530,6 +948,37 @@ const stationCollapse = {
       w.age += dt;
       if (w.age > w.life) this.wells.splice(i, 1);
     }
+
+    for (let i = 0; i < this.wells.length; i++) {
+      for (let j = i + 1; j < this.wells.length; j++) {
+        const a = this.wells[i], b = this.wells[j];
+        if (dist2(a.x, a.y, b.x, b.y) < 55 * 55) {
+          const total = a.m + b.m;
+          a.x = (a.x * a.m + b.x * b.m) / total;
+          a.y = (a.y * a.m + b.y * b.m) / total;
+          a.m = Math.min(total, 10);
+          a.life = Math.max(a.life, b.life) + 4;
+          this.wells.splice(j, 1);
+          this.shocks.push({ x: a.x, y: a.y, r: 0 });
+          for (const p of this.particles) {
+            const dx = p.x - a.x, dy = p.y - a.y;
+            const d = Math.hypot(dx, dy) + 1;
+            if (d < 500) {
+              p.vx += dx / d * 420 * (1 - d / 500);
+              p.vy += dy / d * 420 * (1 - d / 500);
+            }
+          }
+          blip(80, 1.1, 'sine', 0.25, 18);
+          toast('SINGULARITIES MERGED');
+          j--;
+        }
+      }
+    }
+    for (let i = this.shocks.length - 1; i >= 0; i--) {
+      this.shocks[i].r += 900 * dt;
+      if (this.shocks[i].r > Math.max(W, H)) this.shocks.splice(i, 1);
+    }
+
     for (let i = 0; i < this.particles.length; i++) {
       const p = this.particles[i];
       if (this.wells.length === 0) {
@@ -588,9 +1037,154 @@ const stationCollapse = {
       tc.arc(w.x, w.y, radius + Math.sin(timeNow * 5 + w.eaten) * 2, 0, TAU);
       tc.stroke();
     }
+    for (const s of this.shocks) {
+      tc.strokeStyle = 'rgba(220,200,255,' + clamp(1 - s.r / Math.max(W, H), 0, 1) * 0.7 + ')';
+      tc.lineWidth = 2;
+      tc.beginPath();
+      tc.arc(s.x, s.y, s.r, 0, TAU);
+      tc.stroke();
+    }
     ctx.save();
     ctx.globalAlpha = a;
     ctx.drawImage(this.trail, 0, 0);
+    ctx.restore();
+  },
+};
+
+// ------------------------------------------------ 97.3 MIRROR (delayed phantoms)
+const stationMirror = {
+  id: 'mirror', f: 97.3, name: 'MIRROR', sub: 'it shows you seven seconds ago',
+  hint: 'move. then watch who follows. they click when you clicked.',
+  audioLevel: 0.08,
+  voices: [
+    { type: 'sine', f: 311.1, cut: 800, lvl: 0.16 },
+    { type: 'sine', f: 313.5, cut: 800, lvl: 0.16 },
+    { type: 'triangle', f: 77.8, cut: 300, lvl: 0.3 },
+  ],
+  signal: 0, buffer: [], pendingClick: false,
+  trail: null, trailCtx: null, rings: [],
+  deviating: 0, deviateTimer: 10, devX: 0, devY: 0,
+
+  resize() {
+    this.trail = document.createElement('canvas');
+    this.trail.width = W; this.trail.height = H;
+    this.trailCtx = this.trail.getContext('2d');
+    this.buffer = [];
+    this.rings = [];
+  },
+
+  onClick(x, y) {
+    this.pendingClick = true;
+    this.rings.push({ x, y, r: 0, hue: 160 });
+    blip(740, 0.18, 'sine', 0.07, 380);
+  },
+
+  sample(delay) {
+    const target = timeNow - delay;
+    const buf = this.buffer;
+    for (let i = buf.length - 1; i >= 1; i--) {
+      if (buf[i - 1].t <= target && buf[i].t >= target) {
+        const a = buf[i - 1], b = buf[i];
+        const k = (target - a.t) / Math.max(0.0001, b.t - a.t);
+        return { x: lerp(a.x, b.x, k), y: lerp(a.y, b.y, k), click: b.click && k > 0.5 && !b.consumed ? b : null };
+      }
+    }
+    return null;
+  },
+
+  update(dt) {
+    this.buffer.push({ x: mouse.x, y: mouse.y, t: timeNow, click: this.pendingClick, consumed: false });
+    this.pendingClick = false;
+    while (this.buffer.length && this.buffer[0].t < timeNow - 14) this.buffer.shift();
+
+    this.deviateTimer -= dt;
+    if (this.deviateTimer <= 0) {
+      this.deviateTimer = rand(9, 22);
+      if (Math.random() < 0.4) {
+        this.deviating = 1.9;
+        this.devX = rand(0, 1000);
+        this.devY = rand(0, 1000);
+        blip(207, 0.8, 'sine', 0.08, 311);
+      }
+    }
+    if (this.deviating > 0) this.deviating -= dt;
+
+    for (let i = this.rings.length - 1; i >= 0; i--) {
+      this.rings[i].r += 500 * dt;
+      if (this.rings[i].r > 400) this.rings.splice(i, 1);
+    }
+
+    for (const delay of [3, 7]) {
+      const target = timeNow - delay;
+      const key = 'replayedUntil' + delay;
+      const prev = this[key] === undefined ? target : this[key];
+      for (const e of this.buffer) {
+        if (e.t > prev && e.t <= target && e.click) {
+          this.rings.push({ x: e.x, y: e.y, r: 0, hue: delay === 3 ? 280 : 0 });
+          blip(delay === 3 ? 560 : 420, 0.2, 'sine', 0.05, 240);
+        }
+      }
+      this[key] = target;
+    }
+  },
+
+  drawPhantom(tc, x, y, hue, alpha) {
+    const jx = rand(-1.5, 1.5), jy = rand(-1.5, 1.5);
+    tc.strokeStyle = 'hsla(' + hue + ',80%,65%,' + alpha + ')';
+    tc.lineWidth = 1.5;
+    tc.beginPath();
+    tc.arc(x + jx, y + jy, 8, 0, TAU);
+    tc.stroke();
+    tc.fillStyle = 'hsla(' + hue + ',80%,75%,' + alpha + ')';
+    tc.fillRect(x + jx - 1, y + jy - 1, 2, 2);
+    tc.strokeStyle = 'hsla(' + ((hue + 120) % 360) + ',80%,65%,' + (alpha * 0.4) + ')';
+    tc.beginPath();
+    tc.arc(x - jx, y - jy, 8, 0, TAU);
+    tc.stroke();
+  },
+
+  update7Pos() {
+    if (this.deviating > 0) {
+      const k = timeNow * 1.7;
+      return {
+        x: W / 2 + Math.sin(k + this.devX) * W * 0.3,
+        y: H / 2 + Math.cos(k * 1.31 + this.devY) * H * 0.3,
+      };
+    }
+    return this.sample(7);
+  },
+
+  draw(a) {
+    const tc = this.trailCtx;
+    tc.fillStyle = 'rgba(0,4,6,0.10)';
+    tc.fillRect(0, 0, W, H);
+
+    tc.fillStyle = 'rgba(120,255,220,0.9)';
+    tc.fillRect(mouse.x - 1, mouse.y - 1, 2, 2);
+
+    const p3 = this.sample(3);
+    if (p3) this.drawPhantom(tc, p3.x, p3.y, 280, 0.7);
+    const p7 = this.update7Pos();
+    if (p7) this.drawPhantom(tc, p7.x, p7.y, this.deviating > 0 ? 0 : 180, 0.55);
+
+    for (const ring of this.rings) {
+      tc.strokeStyle = 'hsla(' + ring.hue + ',80%,70%,' + clamp(1 - ring.r / 400, 0, 1) * 0.6 + ')';
+      tc.lineWidth = 1.5;
+      tc.beginPath();
+      tc.arc(ring.x, ring.y, ring.r, 0, TAU);
+      tc.stroke();
+    }
+
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.drawImage(this.trail, 0, 0);
+    if (this.deviating > 0) {
+      ctx.font = '19px "VT323", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(255,120,120,' + (0.5 * a) + ')';
+      ctx.fillText('that one is not yours.', W / 2, H * 0.2);
+      ctx.textAlign = 'left';
+    }
     ctx.restore();
   },
 };
@@ -610,7 +1204,28 @@ const GHOST_TRIGGERS = [
   [/bye|goodbye/i, 'you always say that.'],
   [/love/i, 'that frequency is reserved.'],
   [/dead|ghost/i, 'rude. accurate, but rude.'],
+  [/eye/i, 'do not stare back. i warned them too.'],
+  [/rain/i, 'it remembers being code. i remember being someone.'],
+  [/fire|ember/i, 'we lost the transmitter to it in 1987.'],
+  [/sea|ocean|whale|water/i, 'the sea is at 105.3. it never stopped singing.'],
+  [/mirror/i, 'the one at 97.3 is seven seconds behind. do not let it catch up.'],
+  [/number/i, 'the numbers are not for you. until they are.'],
+  [/1987/i, 'you noticed. good.'],
+  [/100|broadcast/i, 'so you know. then hurry.'],
+  [/operator|radio|station/i, 'every station is somebody. i am this one.'],
 ];
+const GHOST_PROGRESS = {
+  rain: 'the rain at 88.3 fell upward once. nobody believed me.',
+  ember: 'mind the fire at 89.9. it took the transmitter once.',
+  bloom: 'the garden at 91.7 plays itself. i used to hum along.',
+  swarm: 'the swarm learned your hands already. they told me.',
+  collapse: 'do not feed the holes at 95.5 too much.',
+  mirror: 'you met the mirror. was it still you?',
+  numbers: 'have you written the numbers down? someone should.',
+  sky: 'name a constellation after me. any name will do.',
+  undertow: 'i can hear the sea from here. 105.3. it never stops.',
+  eye: 'the eye told me you were coming.',
+};
 
 const stationGhost = {
   id: 'ghost', f: 99.1, name: 'THE GHOST', sub: 'transmitting since 1987',
@@ -627,6 +1242,21 @@ const stationGhost = {
   resize() {},
 
   composeSentence() {
+    const allFound = visibleFoundCount() === totalVisible();
+    if (allFound && !seenBroadcast && Math.random() < 0.35) {
+      return pick([
+        'go to one hundred point zero.',
+        '100.0. it is waiting for you now.',
+        'the middle of the dial. exactly. go.',
+      ]);
+    }
+    if (Math.random() < 0.22) {
+      const known = Object.keys(GHOST_PROGRESS).filter(id => {
+        const st = STATIONS.find(s => s.id === id);
+        return st && foundSet.has(st.f);
+      });
+      if (known.length) return GHOST_PROGRESS[pick(known)];
+    }
     if (Math.random() < 0.3) return pick(GHOST_SHORT);
     return pick(GHOST_OPEN) + ', ' + pick(GHOST_MID) + ' ' + pick(GHOST_END);
   },
@@ -658,6 +1288,7 @@ const stationGhost = {
     if (last.who !== 'user') this.lines.push({ who: 'user', text: '' });
     const line = this.lines[this.lines.length - 1];
     line.text += key;
+    blip(rand(1700, 2300), 0.018, 'square', 0.02);
     if (line.text.length > this.maxChars()) this.lines.push({ who: 'user', text: '' });
     this.userTypedAt = timeNow;
   },
@@ -698,6 +1329,7 @@ const stationGhost = {
       let last = this.lines[this.lines.length - 1];
       if (last.who !== 'ghost') { this.lines.push({ who: 'ghost', text: '' }); last = this.lines[this.lines.length - 1]; }
       last.text += token;
+      if (token !== ' ' && this.signal > 0.35) blip(rand(1100, 1500), 0.012, 'square', 0.012);
       if (token === ' ' && last.text.length > this.maxChars()) this.lines.push({ who: 'ghost', text: '' });
     } else if (token.nl) {
       this.lines.push({ who: 'ghost', text: '' });
@@ -749,6 +1381,151 @@ const stationGhost = {
   },
 };
 
+// ------------------------------------------------ 101.1 NUMBERS
+const stationNumbers = {
+  id: 'numbers', f: 101.1, name: 'NUMBERS', sub: 'someone is still counting',
+  hint: 'listen. write them down. press digits and it repeats you.',
+  audioLevel: 0.07,
+  voices: [
+    { type: 'sine', f: 440, cut: 1000, lvl: 0.04 },
+    { type: 'sine', f: 220, cut: 700, lvl: 0.14 },
+    { type: 'triangle', f: 55, cut: 250, lvl: 0.3 },
+  ],
+  signal: 0, group: '', revealed: 0, phase: 'rest', phaseT: 1.5,
+  history: [], lastGroup: '', echoNext: false, bgCols: [], scopePulse: 0,
+
+  resize() {
+    this.bgCols = [];
+    const n = Math.ceil(W / 60);
+    for (let i = 0; i < n; i++) {
+      this.bgCols.push({ x: i * 60 + 18, y: rand(0, H), sp: rand(8, 26), digits: String((Math.random() * 1e8) | 0).padStart(8, '0') });
+    }
+  },
+
+  newGroup() {
+    const allFound = visibleFoundCount() === totalVisible();
+    if (allFound && !seenBroadcast) {
+      this.group = '100.0';
+    } else if (this.echoNext && this.lastGroup) {
+      this.group = this.lastGroup;
+      this.echoNext = false;
+    } else {
+      this.group = '';
+      for (let i = 0; i < 5; i++) this.group += (Math.random() * 10) | 0;
+      this.lastGroup = this.group;
+      this.echoNext = Math.random() < 0.25;
+    }
+  },
+
+  parrot(digit) {
+    blip(880, 0.1, 'sine', 0.07);
+    speak(DIGIT_WORDS[+digit], this.signal * 0.9);
+    this.scopePulse = 1;
+  },
+
+  onClick() {
+    if (this.lastGroup) {
+      this.phase = 'tones';
+      this.phaseT = 0;
+      this.group = this.lastGroup;
+      this.revealed = 0;
+      toast('REPEATING LAST GROUP');
+    }
+  },
+
+  update(dt) {
+    this.phaseT -= dt;
+    this.scopePulse = Math.max(0, this.scopePulse - dt * 2);
+
+    if (this.signal < 0.4) {
+      if (this.phase === 'speak') { try { speechSynthesis.cancel(); } catch (e) {} }
+      this.phase = 'rest';
+      this.phaseT = Math.max(this.phaseT, 0.5);
+      return;
+    }
+
+    if (this.phaseT <= 0) {
+      if (this.phase === 'rest') {
+        this.phase = 'tones';
+        this.phaseT = 1.6;
+        if (!this.group || this.revealed >= this.group.length) { this.newGroup(); this.revealed = 0; }
+        blipAt(0, 880, 0.12, 'sine', 0.06);
+        blipAt(0.45, 880, 0.12, 'sine', 0.06);
+        blipAt(0.9, 880, 0.12, 'sine', 0.06);
+      } else if (this.phase === 'tones') {
+        this.phase = 'speak';
+        this.phaseT = 0.62;
+      } else if (this.phase === 'speak') {
+        if (this.revealed < this.group.length) {
+          const ch = this.group[this.revealed];
+          this.revealed++;
+          this.scopePulse = 1;
+          if (ch === '.') speak('point', this.signal * 0.85);
+          else { speak(DIGIT_WORDS[+ch], this.signal * 0.85); blip(660, 0.05, 'sine', 0.02); }
+          this.phaseT = 0.62;
+        } else {
+          this.history.unshift(this.group);
+          if (this.history.length > 6) this.history.pop();
+          this.phase = 'rest';
+          this.phaseT = rand(1.8, 3.2);
+        }
+      }
+    }
+  },
+
+  draw(a) {
+    ctx.save();
+    ctx.globalAlpha = a;
+
+    ctx.font = '18px "VT323", monospace';
+    for (const col of this.bgCols) {
+      col.y += col.sp * 0.016;
+      if (col.y > H) col.y = -160;
+      for (let i = 0; i < 8; i++) {
+        ctx.fillStyle = 'rgba(90,130,100,' + (0.10 * a) + ')';
+        ctx.fillText(col.digits[i], col.x, col.y + i * 20);
+      }
+    }
+
+    const allFound = visibleFoundCount() === totalVisible();
+    const special = this.group === '100.0';
+    ctx.textAlign = 'center';
+    ctx.font = Math.round(Math.min(140, W / 8)) + 'px "VT323", monospace';
+    const shown = this.group.slice(0, this.revealed);
+    ctx.fillStyle = special ? 'rgba(255,215,130,' + (0.95 * a) + ')' : 'rgba(190,255,205,' + (0.9 * a) + ')';
+    ctx.shadowColor = special ? 'rgba(255,200,80,0.8)' : 'rgba(80,255,140,0.6)';
+    ctx.shadowBlur = 26;
+    ctx.fillText(shown.split('').join(' '), W / 2, H * 0.44);
+    ctx.shadowBlur = 0;
+
+    ctx.font = '24px "VT323", monospace';
+    for (let i = 0; i < this.history.length; i++) {
+      ctx.fillStyle = 'rgba(140,200,160,' + ((0.4 - i * 0.06) * a) + ')';
+      ctx.fillText(this.history[i].split('').join(' '), W / 2, H * 0.44 - 110 - i * 32);
+    }
+
+    if (allFound && !seenBroadcast) {
+      ctx.font = '20px "VT323", monospace';
+      ctx.fillStyle = 'rgba(255,215,130,' + ((0.5 + 0.3 * Math.sin(timeNow * 2)) * a) + ')';
+      ctx.fillText('the numbers have changed.', W / 2, H * 0.58);
+    }
+
+    const scopeY = H * 0.7;
+    ctx.strokeStyle = 'rgba(120,255,170,' + (0.5 * a) + ')';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let x = W * 0.25; x <= W * 0.75; x += 4) {
+      const k = (x - W * 0.25) / (W * 0.5);
+      const env = Math.sin(k * Math.PI);
+      const yy = scopeY + Math.sin(x * 0.09 + timeNow * 20) * 26 * env * this.scopePulse + Math.sin(x * 0.013 + timeNow * 2) * 4 * env;
+      if (x === W * 0.25) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+    }
+    ctx.stroke();
+    ctx.textAlign = 'left';
+    ctx.restore();
+  },
+};
+
 // ------------------------------------------------ 103.9 FIRMAMENT (constellations)
 const CONST_A = ['VESPER', 'HOLLOW', 'PALE', 'SILENT', 'DROWNED', 'IRON', 'LAST', 'WANDERING', 'BROKEN', 'SLEEPING'];
 const CONST_B = ['CROWN', 'SERPENT', 'ANTLER', 'LANTERN', 'ORPHAN', 'VEIL', 'HARP', 'KEY', 'HOUND', 'ANCHOR'];
@@ -763,7 +1540,7 @@ const stationSky = {
     { type: 'triangle', f: 784, cut: 2400, lvl: 0.06 },
     { type: 'sine', f: 130.8, cut: 500, lvl: 0.22 },
   ],
-  signal: 0, bgStars: [], userStars: [], names: [], shooting: null, shootTimer: 5,
+  signal: 0, bgStars: [], userStars: [], names: [], shooting: null, shootTimer: 5, goldFlash: 0,
 
   resize() {
     this.bgStars = [];
@@ -780,6 +1557,7 @@ const stationSky = {
   onClick(x, y) {
     if (this.userStars.length >= 110) this.userStars.shift();
     this.userStars.push({ x, y, born: timeNow });
+    blip(rand(1100, 1500), 0.3, 'sine', 0.05);
     this.findConstellations();
   },
 
@@ -807,10 +1585,14 @@ const stationSky = {
       const near = this.names.find(n => dist2(n.x, n.y, cx, cy) < 220 * 220);
       if (near) { near.x = cx; near.y = cy; near.count = cluster.length; continue; }
       this.names.push({ x: cx, y: cy, text: 'THE ' + pick(CONST_A) + ' ' + pick(CONST_B), born: timeNow, count: cluster.length });
+      this.goldFlash = 1;
+      blipAt(0, 1046, 0.3, 'triangle', 0.07);
+      blipAt(0.12, 1318, 0.5, 'triangle', 0.07);
     }
   },
 
   update(dt) {
+    this.goldFlash = Math.max(0, this.goldFlash - dt * 0.5);
     this.shootTimer -= dt;
     if (this.shootTimer < 0 && !this.shooting) {
       this.shooting = { x: rand(W * 0.2, W * 0.9), y: rand(0, H * 0.3), vx: rand(-900, -500), vy: rand(200, 420), t: 0 };
@@ -834,6 +1616,19 @@ const stationSky = {
     grad.addColorStop(1, 'rgba(10,4,24,' + a + ')');
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, W, H);
+
+    for (let band = 0; band < 2; band++) {
+      ctx.beginPath();
+      const baseY = 70 + band * 46;
+      for (let x = 0; x <= W; x += 14) {
+        const yy = baseY + Math.sin(x * 0.004 + timeNow * 0.25 + band * 2.2) * 38 + Math.sin(x * 0.011 - timeNow * 0.13) * 16;
+        if (x === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+      }
+      const hue = 120 + 40 * Math.sin(timeNow * 0.1 + band);
+      ctx.strokeStyle = 'hsla(' + hue.toFixed(0) + ',70%,60%,' + (0.10 * a) + ')';
+      ctx.lineWidth = 26;
+      ctx.stroke();
+    }
 
     for (const s of this.bgStars) {
       const tw = 0.45 + 0.55 * Math.sin(timeNow * 1.7 + s.tw);
@@ -859,7 +1654,11 @@ const stationSky = {
         const d2 = dist2(stars[i].x, stars[i].y, stars[j].x, stars[j].y);
         if (d2 < 170 * 170) {
           const k = 1 - Math.sqrt(d2) / 170;
-          ctx.strokeStyle = 'rgba(150,190,255,' + (k * 0.55 * a).toFixed(3) + ')';
+          if (this.goldFlash > 0) {
+            ctx.strokeStyle = 'rgba(255,215,130,' + (k * (0.3 + this.goldFlash * 0.5) * a).toFixed(3) + ')';
+          } else {
+            ctx.strokeStyle = 'rgba(150,190,255,' + (k * 0.55 * a).toFixed(3) + ')';
+          }
           ctx.beginPath();
           ctx.moveTo(stars[i].x, stars[i].y);
           ctx.lineTo(stars[j].x, stars[j].y);
@@ -885,9 +1684,180 @@ const stationSky = {
       const reveal = clamp((timeNow - n.born) * 0.8, 0, 1);
       const shown = n.text.slice(0, Math.ceil(n.text.length * reveal));
       ctx.fillStyle = 'rgba(190,215,255,' + (0.85 * a) + ')';
-      ctx.fillText(shown.split('').join(' '), n.x, n.y - 26);
+      ctx.fillText(shown.split('').join(' '), n.x, n.y - 26);
     }
     ctx.textAlign = 'left';
+    ctx.restore();
+  },
+};
+
+// ------------------------------------------------ 105.3 UNDERTOW (deep sea)
+const stationUndertow = {
+  id: 'undertow', f: 105.3, name: 'UNDERTOW', sub: 'the sea never stopped singing',
+  hint: 'your cursor is a light. they like it. click to send a sonar ping.',
+  audioLevel: 0.12,
+  voices: [
+    { type: 'sine', f: 49, cut: 200, lvl: 0.5 },
+    { type: 'sine', f: 98, cut: 300, lvl: 0.2 },
+    { type: 'sine', f: 185, cut: 700, lvl: 0.12, vib: { rate: 0.07, depth: 700 } },
+  ],
+  signal: 0, jellies: [], whales: [], pings: [],
+
+  resize() {
+    this.jellies = [];
+    for (let i = 0; i < 22; i++) {
+      this.jellies.push({
+        x: rand(0, W), y: rand(H * 0.3, H), vx: 0, vy: 0,
+        phase: rand(0, TAU), hue: rand(160, 320), size: rand(9, 26),
+      });
+    }
+    this.whales = [
+      { x: rand(0, W), y: H * 0.55, dir: 1, speed: rand(12, 22), size: rand(160, 240), reveal: 0 },
+      { x: rand(0, W), y: H * 0.75, dir: -1, speed: rand(8, 16), size: rand(220, 320), reveal: 0 },
+    ];
+    this.pings = [];
+  },
+
+  onClick(x, y) {
+    this.pings.push({ x, y, r: 0 });
+    blip(520, 0.7, 'sine', 0.14, 58);
+  },
+
+  update(dt) {
+    for (const j of this.jellies) {
+      j.phase += dt * 2;
+      const pulse = Math.max(0, Math.sin(j.phase));
+      j.vy -= pulse * 26 * dt + 4 * dt;
+      const md = Math.sqrt(dist2(j.x, j.y, mouse.x, mouse.y));
+      if (md < 280 && md > 30) {
+        j.vx += (mouse.x - j.x) / md * 30 * dt;
+        j.vy += (mouse.y - j.y) / md * 30 * dt;
+      }
+      j.vx += rand(-1, 1) * 8 * dt;
+      j.vx *= Math.pow(0.5, dt);
+      j.vy *= Math.pow(0.5, dt);
+      j.x += j.vx * dt;
+      j.y += j.vy * dt;
+      if (j.y < -40) { j.y = H + 40; j.x = rand(0, W); }
+      if (j.x < -40) j.x = W + 40;
+      if (j.x > W + 40) j.x = -40;
+    }
+
+    for (const w of this.whales) {
+      w.x += w.dir * w.speed * dt;
+      if (w.x > W + w.size * 1.5) w.x = -w.size * 1.5;
+      if (w.x < -w.size * 1.5) w.x = W + w.size * 1.5;
+      w.reveal = Math.max(0, w.reveal - dt * 0.4);
+    }
+
+    for (let i = this.pings.length - 1; i >= 0; i--) {
+      const p = this.pings[i];
+      p.r += 430 * dt;
+      for (const w of this.whales) {
+        const d = Math.sqrt(dist2(p.x, p.y, w.x, w.y));
+        if (Math.abs(d - p.r) < 46) {
+          if (w.reveal < 0.5) blip(rand(140, 200), 1.6, 'sine', 0.12, rand(70, 110));
+          w.reveal = 1;
+        }
+      }
+      if (p.r > Math.max(W, H) * 1.2) this.pings.splice(i, 1);
+    }
+  },
+
+  draw(a) {
+    ctx.save();
+    ctx.globalAlpha = a;
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, 'rgba(4,18,34,' + a + ')');
+    grad.addColorStop(1, 'rgba(1,4,12,' + a + ')');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    for (let layer = 0; layer < 3; layer++) {
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      const baseY = 36 + layer * 22;
+      for (let x = 0; x <= W; x += 12) {
+        ctx.lineTo(x, baseY + Math.sin(x * 0.011 + timeNow * (0.8 + layer * 0.3)) * 9 + Math.sin(x * 0.027 - timeNow * 0.9) * 5);
+      }
+      ctx.lineTo(W, 0);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(30,80,130,' + ((0.16 - layer * 0.04) * a) + ')';
+      ctx.fill();
+    }
+
+    const light = ctx.createRadialGradient(mouse.x, mouse.y, 0, mouse.x, mouse.y, 240);
+    light.addColorStop(0, 'rgba(140,210,255,' + (0.13 * a) + ')');
+    light.addColorStop(1, 'rgba(140,210,255,0)');
+    ctx.fillStyle = light;
+    ctx.fillRect(mouse.x - 240, mouse.y - 240, 480, 480);
+
+    for (const w of this.whales) {
+      ctx.save();
+      ctx.translate(w.x, w.y + Math.sin(timeNow * 0.4 + w.x * 0.01) * 10);
+      ctx.scale(w.dir, 1);
+      const body = () => {
+        ctx.beginPath();
+        ctx.ellipse(0, 0, w.size, w.size * 0.3, 0, 0, TAU);
+        ctx.moveTo(-w.size * 0.92, 0);
+        ctx.lineTo(-w.size * 1.28, -w.size * 0.26);
+        ctx.lineTo(-w.size * 1.28, w.size * 0.26);
+        ctx.closePath();
+        ctx.moveTo(w.size * 0.28, w.size * 0.3);
+        ctx.ellipse(w.size * 0.1, w.size * 0.26, w.size * 0.18, w.size * 0.07, -0.5, 0, TAU);
+      };
+      ctx.fillStyle = 'rgba(14,30,52,' + ((0.30 + w.reveal * 0.25) * a) + ')';
+      body();
+      ctx.fill();
+      if (w.reveal > 0.02) {
+        ctx.strokeStyle = 'rgba(150,230,255,' + (w.reveal * 0.75 * a) + ')';
+        ctx.lineWidth = 1.6;
+        ctx.shadowColor = 'rgba(120,220,255,' + (w.reveal * 0.8) + ')';
+        ctx.shadowBlur = 14;
+        body();
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+      ctx.restore();
+    }
+
+    for (const p of this.pings) {
+      const fade = clamp(1 - p.r / (Math.max(W, H) * 1.2), 0, 1);
+      ctx.strokeStyle = 'rgba(120,230,255,' + (fade * 0.5 * a) + ')';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, TAU);
+      ctx.stroke();
+    }
+
+    ctx.globalCompositeOperation = 'lighter';
+    for (const j of this.jellies) {
+      const pulse = 1 + 0.25 * Math.sin(j.phase);
+      const md = Math.sqrt(dist2(j.x, j.y, mouse.x, mouse.y));
+      const glow = clamp(1 - md / 320, 0.25, 1);
+      const bellR = j.size * pulse;
+      ctx.fillStyle = 'hsla(' + j.hue.toFixed(0) + ',85%,65%,' + (0.30 * glow * a).toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.arc(j.x, j.y, bellR, Math.PI, 0);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = 'hsla(' + j.hue.toFixed(0) + ',85%,72%,' + (0.35 * glow * a).toFixed(3) + ')';
+      ctx.lineWidth = 1.2;
+      for (let t = 0; t < 5; t++) {
+        const tx = j.x - bellR * 0.7 + t * bellR * 0.35;
+        ctx.beginPath();
+        ctx.moveTo(tx, j.y);
+        for (let seg = 1; seg <= 5; seg++) {
+          ctx.lineTo(tx + Math.sin(j.phase * 1.5 + t + seg) * 4 * seg * 0.4, j.y + seg * j.size * 0.4);
+        }
+        ctx.stroke();
+      }
+      const halo = ctx.createRadialGradient(j.x, j.y, 0, j.x, j.y, bellR * 3);
+      halo.addColorStop(0, 'hsla(' + j.hue.toFixed(0) + ',85%,65%,' + (0.12 * glow * a) + ')');
+      halo.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = halo;
+      ctx.fillRect(j.x - bellR * 3, j.y - bellR * 3, bellR * 6, bellR * 6);
+    }
     ctx.restore();
   },
 };
@@ -903,6 +1873,7 @@ const stationEye = {
     { type: 'sine', f: 1318.5, cut: 4000, lvl: 0.02 },
   ],
   signal: 0, particles: [], lid: 0, lidTarget: 0, blinkTimer: 3, scatter: 0,
+  watchTime: 0, extraEyes: [],
 
   resize() {
     this.particles = [];
@@ -915,13 +1886,20 @@ const stationEye = {
         vx: 0, vy: 0,
       });
     }
+    this.extraEyes = [
+      { fx: 0.12, fy: 0.18, r: 26, opensAt: 25, lid: 1, blinkT: rand(2, 5) },
+      { fx: 0.88, fy: 0.2, r: 20, opensAt: 60, lid: 1, blinkT: rand(2, 5) },
+      { fx: 0.85, fy: 0.78, r: 16, opensAt: 110, lid: 1, blinkT: rand(2, 5) },
+    ];
   },
 
-  onClick() { this.lidTarget = 1; this.blinkTimer = 0.22; },
+  onClick() { this.lidTarget = 1; this.blinkTimer = 0.22; blip(160, 0.25, 'sine', 0.08, 60); },
 
   update(dt) {
     const cx = W / 2, cy = H / 2;
     const eyeRadius = Math.min(W, H) * 0.24;
+
+    if (this.signal > 0.6) this.watchTime += dt;
 
     this.blinkTimer -= dt;
     if (this.blinkTimer <= 0) {
@@ -938,6 +1916,15 @@ const stationEye = {
       }
     }
     if (this.scatter > 0) this.scatter -= dt;
+
+    for (const ex of this.extraEyes) {
+      if (this.watchTime > ex.opensAt) {
+        ex.blinkT -= dt;
+        if (ex.blinkT <= 0) { ex.lid = 1; ex.blinkT = rand(3, 8); }
+        ex.lid = Math.max(0, ex.lid - dt * 4);
+        if (!ex.announced && this.signal > 0.6) { ex.announced = true; toast('ANOTHER ONE OPENED'); }
+      }
+    }
 
     const toMouseX = mouse.x - cx, toMouseY = mouse.y - cy;
     const mouseDist = Math.hypot(toMouseX, toMouseY) + 0.001;
@@ -962,6 +1949,31 @@ const stationEye = {
       p.y += p.vy * dt;
       p.ang += dt * 0.05 * (p.rad > 0.5 ? 1 : -1.4);
     }
+  },
+
+  drawSmallEye(ex, a) {
+    const x = ex.fx * W, y = ex.fy * H;
+    const open = 1 - ex.lid;
+    if (open < 0.02) return;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(1, 0.6 * open);
+    ctx.fillStyle = 'rgba(30,6,8,' + (0.9 * a) + ')';
+    ctx.beginPath();
+    ctx.arc(0, 0, ex.r, 0, TAU);
+    ctx.fill();
+    const dx = mouse.x - x, dy = mouse.y - y;
+    const d = Math.hypot(dx, dy) + 0.001;
+    const m = Math.min(d, ex.r * 0.4);
+    ctx.fillStyle = 'rgba(255,120,60,' + (0.8 * a) + ')';
+    ctx.beginPath();
+    ctx.arc(dx / d * m, dy / d * m, ex.r * 0.42, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(120,10,10,' + (0.95 * a) + ')';
+    ctx.beginPath();
+    ctx.arc(dx / d * m, dy / d * m, ex.r * 0.2, 0, TAU);
+    ctx.fill();
+    ctx.restore();
   },
 
   draw(a) {
@@ -991,6 +2003,18 @@ const stationEye = {
     glow.addColorStop(1, 'rgba(255,30,30,0)');
     ctx.fillStyle = glow;
     ctx.fillRect(px - eyeRadius, py - eyeRadius, eyeRadius * 2, eyeRadius * 2);
+
+    ctx.globalCompositeOperation = 'source-over';
+    for (const ex of this.extraEyes) {
+      if (this.watchTime > ex.opensAt) this.drawSmallEye(ex, a);
+    }
+    if (this.watchTime > 40) {
+      ctx.font = '17px "VT323", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(160,70,70,' + (0.4 * a) + ')';
+      ctx.fillText('it has been watching for ' + (this.watchTime | 0) + ' seconds.', W / 2, H - 116);
+      ctx.textAlign = 'left';
+    }
     ctx.restore();
   },
 };
@@ -999,10 +2023,16 @@ const stationEye = {
 const stationDeadAir = {
   id: 'deadair', f: 87.0, name: 'DEAD AIR', sub: '', hint: '',
   hidden: true, audioLevel: 0.0,
-  signal: 0, tunedFor: 0,
+  signal: 0, tunedFor: 0, beatT: 0,
   resize() {},
   update(dt) {
     if (this.signal > 0.8) this.tunedFor += dt; else this.tunedFor = 0;
+    this.beatT -= dt;
+    if (this.beatT <= 0 && this.signal > 0.7) {
+      this.beatT = 1.15;
+      blipAt(0, 46, 0.14, 'sine', 0.30);
+      blipAt(0.18, 40, 0.16, 'sine', 0.22);
+    }
   },
   draw(a) {
     const beat = Math.pow(Math.max(0, Math.sin(timeNow * 1.1)), 12);
@@ -1021,14 +2051,109 @@ const stationDeadAir = {
     }
     if (this.tunedFor > 7) {
       ctx.fillStyle = 'rgba(120,50,50,' + (a * clamp(this.tunedFor - 7, 0, 1) * 0.8) + ')';
-      ctx.fillText('(you can go back up now.)', W / 2, H / 2 + 36);
+      ctx.fillText('(only a heartbeat. ignore it.)', W / 2, H / 2 + 36);
     }
     ctx.textAlign = 'left';
     ctx.restore();
   },
 };
 
-const STATIONS = [stationDeadAir, stationRain, stationBloom, stationCollapse, stationGhost, stationSky, stationEye];
+// ------------------------------------------------ 100.0 THE BROADCAST (hidden finale)
+const BROADCAST_LINES = [
+  'you found them all.',
+  'eleven lights in twenty-one megahertz of dark.',
+  'most people scroll past.',
+  'you stayed. you tuned. you listened.',
+  'this station does not exist.',
+  'neither do i.',
+  'but the dial is yours now.',
+  '87.0 to 108.0. forever.',
+  '— the operator',
+];
+const stationBroadcast = {
+  id: 'broadcast', f: 100.0, name: 'THE BROADCAST', sub: 'for you. only you.',
+  hint: '',
+  hidden: true, audioLevel: 0.09,
+  voices: [
+    { type: 'sine', f: 130.8, cut: 700, lvl: 0.3 },
+    { type: 'sine', f: 196, cut: 900, lvl: 0.2 },
+    { type: 'sine', f: 246.9, cut: 1100, lvl: 0.16 },
+    { type: 'sine', f: 293.7, cut: 1300, lvl: 0.12 },
+    { type: 'triangle', f: 65.4, cut: 300, lvl: 0.3 },
+  ],
+  signal: 0, lineIndex: 0, charIndex: 0, charTimer: 0, holdTimer: 0, finished: false,
+
+  resize() {},
+
+  update(dt) {
+    stationRain.update(dt);
+    stationSky.update(dt);
+    stationEye.update(dt);
+
+    if (!seenBroadcast && this.signal > 0.8) {
+      seenBroadcast = true;
+      try { localStorage.setItem('nightdial_broadcast', '1'); } catch (e) {}
+      toast('◉ THE BROADCAST');
+      discoveryJingle();
+    }
+
+    if (this.finished) return;
+    if (this.holdTimer > 0) { this.holdTimer -= dt; return; }
+    this.charTimer -= dt;
+    if (this.charTimer <= 0) {
+      this.charTimer = 0.055;
+      const line = BROADCAST_LINES[this.lineIndex];
+      if (this.charIndex < line.length) {
+        this.charIndex++;
+        if (this.signal > 0.4) blip(rand(900, 1200), 0.012, 'square', 0.012);
+      } else {
+        this.holdTimer = 1.6;
+        if (this.lineIndex < BROADCAST_LINES.length - 1) {
+          this.lineIndex++;
+          this.charIndex = 0;
+        } else {
+          this.finished = true;
+        }
+      }
+    }
+  },
+
+  draw(a) {
+    ctx.save();
+    stationSky.draw(a * 0.6);
+    stationRain.draw(a * 0.16);
+    stationEye.draw(a * 0.25);
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.fillStyle = 'rgba(0,0,0,' + (0.45 * a) + ')';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.font = '30px "VT323", monospace';
+    const baseY = H / 2 - BROADCAST_LINES.length * 22;
+    for (let i = 0; i < this.lineIndex; i++) {
+      ctx.fillStyle = 'rgba(235,225,180,' + (0.75 * a) + ')';
+      ctx.fillText(BROADCAST_LINES[i], W / 2, baseY + i * 44);
+    }
+    const current = BROADCAST_LINES[this.lineIndex].slice(0, this.charIndex);
+    ctx.fillStyle = 'rgba(255,245,200,' + (0.95 * a) + ')';
+    ctx.fillText(current + (Math.floor(timeNow * 2.4) % 2 === 0 && !this.finished ? '█' : ''), W / 2, baseY + this.lineIndex * 44);
+    if (this.finished) {
+      ctx.font = '19px "VT323", monospace';
+      ctx.fillStyle = 'rgba(190,200,160,' + ((0.4 + 0.2 * Math.sin(timeNow * 1.5)) * a) + ')';
+      ctx.fillText('(stay as long as you like.)', W / 2, baseY + BROADCAST_LINES.length * 44 + 30);
+    }
+    ctx.textAlign = 'left';
+    ctx.restore();
+  },
+};
+
+const STATIONS = [
+  stationDeadAir, stationRain, stationEmber, stationBloom, stationSwarm,
+  stationCollapse, stationMirror, stationGhost, stationBroadcast,
+  stationNumbers, stationSky, stationUndertow, stationEye,
+];
 
 function strongestStation() {
   let best = null;
@@ -1056,11 +2181,14 @@ function drawUI(maxSignal) {
   ctx.fillText('MHz', 28 + freqWidth + 12, 92);
 
   const active = strongestStation();
-  if (active && active.signal > 0.25 && !active.hidden) {
+  const showName = active && active.signal > 0.25 && (!active.hidden || active.id === 'broadcast');
+  if (showName) {
     const a = clamp((active.signal - 0.25) / 0.5, 0, 1);
     ctx.textAlign = 'center';
     ctx.font = '42px "VT323", monospace';
-    ctx.fillStyle = 'rgba(225,255,235,' + (a * 0.95 * flicker) + ')';
+    ctx.fillStyle = active.id === 'broadcast'
+      ? 'rgba(255,240,190,' + (a * 0.95 * flicker) + ')'
+      : 'rgba(225,255,235,' + (a * 0.95 * flicker) + ')';
     ctx.fillText(active.name, W / 2, 64);
     ctx.font = '20px "VT323", monospace';
     ctx.fillStyle = 'rgba(140,210,160,' + (a * 0.75) + ')';
@@ -1107,25 +2235,27 @@ function drawUI(maxSignal) {
   ctx.textAlign = 'left';
 
   for (const st of STATIONS) {
-    if (!foundSet.has(st.f)) continue;
+    if (!foundSet.has(st.f) && !(st.id === 'broadcast' && seenBroadcast)) continue;
+    if (st.id === 'broadcast' && !seenBroadcast) continue;
     const x = freqToX(st.f);
     const pulse = 0.6 + 0.4 * Math.sin(timeNow * 3 + st.f);
-    ctx.fillStyle = st.hidden
-      ? 'rgba(160,70,70,' + (0.5 * pulse) + ')'
-      : 'rgba(140,255,175,' + (0.85 * pulse) + ')';
+    if (st.id === 'broadcast') ctx.fillStyle = 'rgba(255,215,130,' + (0.9 * pulse) + ')';
+    else if (st.hidden) ctx.fillStyle = 'rgba(160,70,70,' + (0.5 * pulse) + ')';
+    else ctx.fillStyle = 'rgba(140,255,175,' + (0.85 * pulse) + ')';
     ctx.beginPath();
     ctx.arc(x, dialY - 18, 3, 0, TAU);
     ctx.fill();
   }
 
   const needleX = freqToX(freq);
-  ctx.strokeStyle = 'rgba(255,240,200,0.95)';
+  const needleColor = seenBroadcast ? 'rgba(255,224,150,0.95)' : 'rgba(255,240,200,0.95)';
+  ctx.strokeStyle = needleColor;
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(needleX, dialY - 26);
   ctx.lineTo(needleX, dialY + 8);
   ctx.stroke();
-  ctx.fillStyle = 'rgba(255,240,200,0.95)';
+  ctx.fillStyle = needleColor;
   ctx.beginPath();
   ctx.moveTo(needleX - 5, dialY - 32);
   ctx.lineTo(needleX + 5, dialY - 32);
@@ -1133,7 +2263,7 @@ function drawUI(maxSignal) {
   ctx.closePath();
   ctx.fill();
   const needleGlow = ctx.createRadialGradient(needleX, dialY - 10, 0, needleX, dialY - 10, 40);
-  needleGlow.addColorStop(0, 'rgba(255,240,200,0.18)');
+  needleGlow.addColorStop(0, seenBroadcast ? 'rgba(255,215,130,0.22)' : 'rgba(255,240,200,0.18)');
   needleGlow.addColorStop(1, 'rgba(255,240,200,0)');
   ctx.fillStyle = needleGlow;
   ctx.fillRect(needleX - 40, dialY - 50, 80, 80);
@@ -1142,7 +2272,7 @@ function drawUI(maxSignal) {
   let hint = '';
   if (active && active.signal > 0.6 && !active.hidden) hint = active.hint;
   else if (timeNow - bootAt < 14) hint = 'scroll to tune · or drag the dial';
-  else if ([...foundSet].filter(f => { const s = STATIONS.find(st => st.f === f); return s && !s.hidden; }).length === 0) hint = 'stations hide between the static';
+  else if (visibleFoundCount() === 0) hint = 'stations hide between the static';
   if (hint) {
     ctx.font = '19px "VT323", monospace';
     ctx.textAlign = 'center';
@@ -1152,13 +2282,22 @@ function drawUI(maxSignal) {
   }
 
   // ---- footer
-  const foundCount = [...foundSet].filter(f => { const s = STATIONS.find(st => st.f === f); return s && !s.hidden; }).length;
+  const foundCount = visibleFoundCount();
+  const total = totalVisible();
   ctx.font = '17px "VT323", monospace';
   ctx.fillStyle = 'rgba(110,190,130,0.6)';
   ctx.fillText('[space] scan   [m] mute   [←→] fine tune', 28, H - 14);
   ctx.textAlign = 'right';
-  ctx.fillStyle = foundCount === 6 ? 'rgba(255,230,140,0.9)' : 'rgba(110,190,130,0.7)';
-  ctx.fillText(foundCount === 6 ? 'ALL 6 STATIONS FOUND — THE DIAL IS YOURS' : foundCount + '/6 STATIONS FOUND', W - 28, H - 14);
+  if (seenBroadcast) {
+    ctx.fillStyle = 'rgba(255,224,150,0.85)';
+    ctx.fillText('THE DIAL IS YOURS', W - 28, H - 14);
+  } else if (foundCount === total) {
+    ctx.fillStyle = 'rgba(255,230,140,' + (0.6 + 0.35 * Math.sin(timeNow * 2.5)) + ')';
+    ctx.fillText('ALL ' + total + ' FOUND — BUT THE NUMBERS CHANGED', W - 28, H - 14);
+  } else {
+    ctx.fillStyle = 'rgba(110,190,130,0.7)';
+    ctx.fillText(foundCount + '/' + total + ' STATIONS FOUND', W - 28, H - 14);
+  }
   ctx.textAlign = 'left';
 
   // ---- toasts
@@ -1166,13 +2305,24 @@ function drawUI(maxSignal) {
     const tst = toasts[i];
     const age = timeNow - tst.born;
     if (age > 3) { toasts.splice(i, 1); continue; }
-    const a = age < 0.3 ? age / 0.3 : age > 2.2 ? 1 - (age - 2.2) / 0.8 : 1;
+    if (age < 0) continue;
+    const a = clamp(age < 0.3 ? age / 0.3 : age > 2.2 ? 1 - (age - 2.2) / 0.8 : 1, 0, 1);
     ctx.font = '26px "VT323", monospace';
     ctx.textAlign = 'center';
     ctx.fillStyle = 'rgba(255,235,170,' + (a * 0.95) + ')';
     ctx.fillText(tst.text, W / 2, 140 + i * 34);
     ctx.textAlign = 'left';
   }
+
+  // ---- custom cursor
+  ctx.strokeStyle = 'rgba(200,255,215,0.85)';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.arc(mouse.x, mouse.y, mouse.down ? 4.5 : 7, 0, TAU);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(220,255,230,0.9)';
+  ctx.fillRect(mouse.x - 1, mouse.y - 1, 2, 2);
+
   ctx.restore();
 }
 
@@ -1180,15 +2330,22 @@ function drawUI(maxSignal) {
 
 function resize() {
   W = innerWidth; H = innerHeight;
-  screen.width = Math.round(W * dpr);
-  screen.height = Math.round(H * dpr);
+  screenEl.width = Math.round(W * dpr);
+  screenEl.height = Math.round(H * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   for (const st of STATIONS) st.resize();
 }
 addEventListener('resize', resize);
 resize();
 
+if (/^#\d{2,3}\.\d$/.test(location.hash)) {
+  const f = parseFloat(location.hash.slice(1));
+  if (f >= FREQ_MIN && f <= FREQ_MAX) { freq = f; targetFreq = f; }
+}
+
 let lastFrame = performance.now();
+let hashFrameCounter = 0;
+
 function frame(now) {
   requestAnimationFrame(frame);
   const dt = clamp((now - lastFrame) / 1000, 0.001, 0.05);
@@ -1196,19 +2353,44 @@ function frame(now) {
   if (!started) return;
   timeNow = now / 1000;
 
+  // idle attract: the radio tunes itself if you walk away
+  if (now - lastInput > 45000) {
+    if (idleTarget === null) {
+      const undiscovered = STATIONS.filter(s => !s.hidden && !foundSet.has(s.f));
+      const pool = undiscovered.length ? undiscovered : STATIONS.filter(s => !s.hidden);
+      idleTarget = pick(pool).f;
+    }
+    const diff = idleTarget - targetFreq;
+    if (Math.abs(diff) < 0.02) {
+      if (now - lastInput > 45000 + 20000) { idleTarget = null; lastInput = now - 45000; }
+    } else {
+      targetFreq += Math.sign(diff) * Math.min(Math.abs(diff), 0.22 * dt);
+    }
+  } else {
+    idleTarget = null;
+  }
+
   freq = lerp(freq, targetFreq, Math.min(1, dt * 7));
 
+  const allFound = visibleFoundCount() === totalVisible();
   let maxSignal = 0;
   for (const st of STATIONS) {
     const d = Math.abs(freq - st.f);
-    let s = Math.max(0, 1 - (d / 0.62) * (d / 0.62));
+    let s = Math.max(0, 1 - (d / 0.55) * (d / 0.55));
     s = s * s * (3 - 2 * s);
+    if (st.id === 'broadcast' && !allFound) s = 0;
     st.signal = s;
     if (s > maxSignal) maxSignal = s;
     if (s > 0.85 && !foundSet.has(st.f)) {
       foundSet.add(st.f);
       persistFound();
-      if (!st.hidden) toast('◉ SIGNAL ACQUIRED — ' + st.name + ' ' + st.f.toFixed(1));
+      if (!st.hidden) {
+        toast('◉ SIGNAL ACQUIRED — ' + st.name + ' ' + st.f.toFixed(1));
+        discoveryJingle();
+        if (visibleFoundCount() === totalVisible()) {
+          toasts.push({ text: 'THE NUMBERS HAVE CHANGED. LISTEN AT 101.1', born: timeNow + 3 });
+        }
+      }
     }
   }
   const noiseLevel = clamp(1 - maxSignal, 0, 1) * 0.96 + 0.04;
@@ -1221,6 +2403,7 @@ function frame(now) {
   const ordered = [...STATIONS].sort((a, b) => a.signal - b.signal);
   for (const st of ordered) if (st.signal > 0.02) st.draw(st.signal);
 
+  drawGlyphEvent(maxSignal);
   drawStatic(noiseLevel * (0.25 + 0.75 * (1 - maxSignal)));
   drawUI(maxSignal);
 
@@ -1230,6 +2413,21 @@ function frame(now) {
     ctx.fillStyle = 'rgba(255,255,255,' + (1 - k) + ')';
     const lineH = Math.max(2, H * Math.pow(k, 2.5));
     ctx.fillRect(0, H / 2 - lineH / 2, W, lineH);
+  }
+
+  // title + hash, throttled
+  hashFrameCounter++;
+  if (hashFrameCounter % 90 === 0) {
+    const active = strongestStation();
+    const newTitle = (active && active.signal > 0.5 && !active.hidden)
+      ? active.name + ' — ' + freq.toFixed(1) + ' NIGHTDIAL'
+      : 'NIGHTDIAL — ' + freq.toFixed(1);
+    if (newTitle !== lastTitle) { document.title = newTitle; lastTitle = newTitle; }
+    const newHash = '#' + freq.toFixed(1);
+    if (newHash !== lastHash && Math.abs(freq - targetFreq) < 0.05) {
+      lastHash = newHash;
+      try { history.replaceState(null, '', newHash); } catch (e) {}
+    }
   }
 
   updateAudio(dt, noiseLevel);
@@ -1242,6 +2440,7 @@ document.getElementById('intro').addEventListener('click', () => {
   if (started) return;
   started = true;
   bootAt = performance.now() / 1000;
+  lastInput = performance.now();
   document.getElementById('intro').classList.add('off');
   try { initAudio(); } catch (e) {}
 });
