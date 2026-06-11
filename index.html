@@ -1,0 +1,1250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>NIGHTDIAL — 87.0 to 108.0</title>
+<meta name="description" content="A radio for the frequencies between frequencies. Six stations are hiding in the static.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+  body { font-family: "VT323", monospace; cursor: crosshair; }
+  canvas#screen { position: fixed; inset: 0; display: block; }
+
+  #crt { position: fixed; inset: 0; pointer-events: none; z-index: 5;
+    background:
+      radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,0.55) 100%),
+      repeating-linear-gradient(0deg, rgba(0,0,0,0.22) 0px, rgba(0,0,0,0.22) 1px, transparent 1px, transparent 3px);
+    animation: crtflicker 7s infinite;
+  }
+  @keyframes crtflicker {
+    0%, 100% { opacity: 1; }
+    92% { opacity: 1; }
+    93% { opacity: 0.86; }
+    94% { opacity: 1; }
+    97% { opacity: 0.93; }
+    98% { opacity: 1; }
+  }
+
+  #intro { position: fixed; inset: 0; z-index: 10; background: #000;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: #9dffb0; text-align: center; cursor: pointer;
+    transition: opacity 0.9s ease; user-select: none;
+  }
+  #intro.off { opacity: 0; pointer-events: none; }
+  #intro h1 { font-size: clamp(64px, 12vw, 150px); font-weight: 400; letter-spacing: 0.08em;
+    text-shadow: 0 0 12px #2cff6e, 0 0 60px rgba(44,255,110,0.45);
+    animation: titlebreathe 4s ease-in-out infinite;
+  }
+  @keyframes titlebreathe {
+    0%, 100% { text-shadow: 0 0 12px #2cff6e, 0 0 50px rgba(44,255,110,0.35); }
+    50% { text-shadow: 0 0 18px #2cff6e, 0 0 90px rgba(44,255,110,0.6); }
+  }
+  #intro p { font-size: clamp(18px, 2.4vw, 28px); color: #5fae72; margin-top: 14px; letter-spacing: 0.06em; }
+  #intro .power { margin-top: 56px; font-size: clamp(20px, 2.6vw, 30px); color: #d8ffe2;
+    border: 1px solid #2f6b40; padding: 10px 34px;
+    animation: powerpulse 1.6s ease-in-out infinite;
+  }
+  @keyframes powerpulse {
+    0%, 100% { opacity: 0.45; box-shadow: 0 0 0 rgba(44,255,110,0); }
+    50% { opacity: 1; box-shadow: 0 0 26px rgba(44,255,110,0.35); }
+  }
+  #intro .fine { position: absolute; bottom: 26px; font-size: 16px; color: #3c5c46; letter-spacing: 0.1em; }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<div id="crt"></div>
+<div id="intro">
+  <h1>NIGHTDIAL</h1>
+  <p>a radio for the frequencies between frequencies.</p>
+  <p>six stations are hiding in the static. find them.</p>
+  <div class="power">[ CLICK TO POWER ON — SOUND RECOMMENDED ]</div>
+  <div class="fine">scroll to tune &nbsp;·&nbsp; space to scan &nbsp;·&nbsp; the dial remembers what you find</div>
+</div>
+
+<script>
+'use strict';
+
+const TAU = Math.PI * 2;
+const screen = document.getElementById('screen');
+const ctx = screen.getContext('2d');
+const dpr = Math.min(window.devicePixelRatio || 1, 1.75);
+let W = 0, H = 0;
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, k) => a + (b - a) * k;
+const dist2 = (ax, ay, bx, by) => (ax - bx) * (ax - bx) + (ay - by) * (ay - by);
+
+// ---------------------------------------------------------------- tuner state
+
+const FREQ_MIN = 87.0, FREQ_MAX = 108.0;
+let freq = 96.2;
+let targetFreq = 96.2;
+let started = false;
+let bootAt = 0;
+let timeNow = 0;
+let muted = false;
+
+const toasts = [];
+function toast(text) { toasts.push({ text, born: timeNow }); }
+
+let foundSet = new Set();
+try { foundSet = new Set(JSON.parse(localStorage.getItem('nightdial_found') || '[]')); } catch (e) {}
+function persistFound() {
+  try { localStorage.setItem('nightdial_found', JSON.stringify([...foundSet])); } catch (e) {}
+}
+
+// ---------------------------------------------------------------- input
+
+const mouse = { x: innerWidth / 2, y: innerHeight / 2, down: false, speed: 0, lastMove: 0, lastT: 0 };
+let dialDragging = false;
+
+function dialZone(y) { return y > H - 96; }
+function freqToX(f) { return 70 + (f - FREQ_MIN) / (FREQ_MAX - FREQ_MIN) * (W - 140); }
+function xToFreq(x) { return clamp(FREQ_MIN + (x - 70) / (W - 140) * (FREQ_MAX - FREQ_MIN), FREQ_MIN, FREQ_MAX); }
+
+addEventListener('pointermove', e => {
+  const now = performance.now();
+  const dt = Math.max(1, now - mouse.lastT);
+  const instSpeed = Math.hypot(e.clientX - mouse.x, e.clientY - mouse.y) / dt * 1000;
+  mouse.speed = lerp(mouse.speed, instSpeed, 0.3);
+  mouse.x = e.clientX; mouse.y = e.clientY;
+  mouse.lastT = now; mouse.lastMove = now;
+  if (dialDragging) targetFreq = xToFreq(e.clientX);
+});
+
+addEventListener('pointerdown', e => {
+  mouse.x = e.clientX; mouse.y = e.clientY;
+  mouse.down = true;
+  if (!started) return;
+  if (dialZone(e.clientY)) { dialDragging = true; targetFreq = xToFreq(e.clientX); return; }
+  const st = strongestStation();
+  if (st && st.signal > 0.45 && st.onClick) st.onClick(e.clientX, e.clientY);
+});
+
+addEventListener('pointerup', () => { mouse.down = false; dialDragging = false; });
+
+addEventListener('wheel', e => {
+  if (!started) return;
+  e.preventDefault();
+  targetFreq = clamp(targetFreq + e.deltaY * 0.0021, FREQ_MIN, FREQ_MAX);
+}, { passive: false });
+
+function scanToNext() {
+  const visible = STATIONS.filter(s => !s.hidden).map(s => s.f).sort((a, b) => a - b);
+  const next = visible.find(f => f > freq + 0.3);
+  targetFreq = next !== undefined ? next : visible[0];
+}
+
+addEventListener('keydown', e => {
+  if (!started) return;
+  const ghost = STATIONS.find(s => s.id === 'ghost');
+  const ghostActive = ghost.signal > 0.5;
+
+  if (e.key === 'ArrowLeft') { e.preventDefault(); targetFreq = clamp(targetFreq - 0.1, FREQ_MIN, FREQ_MAX); return; }
+  if (e.key === 'ArrowRight') { e.preventDefault(); targetFreq = clamp(targetFreq + 0.1, FREQ_MIN, FREQ_MAX); return; }
+
+  if (ghostActive) {
+    if (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Enter') {
+      e.preventDefault();
+      ghost.onKey(e.key);
+      return;
+    }
+  }
+  if (e.key === ' ') { e.preventDefault(); scanToNext(); return; }
+  if (e.key === 'm' || e.key === 'M') { muted = !muted; toast(muted ? 'AUDIO MUTED' : 'AUDIO ON'); return; }
+  if (e.key === 'c' || e.key === 'C') {
+    const sky = STATIONS.find(s => s.id === 'sky');
+    if (sky.signal > 0.5) { sky.clearSky(); toast('SKY CLEARED'); }
+  }
+});
+
+// ---------------------------------------------------------------- audio
+
+let AC = null, masterGain = null, noiseGainNode = null;
+let masterLevel = 0, noiseLevelSmooth = 0;
+
+function buildVoice(destination, type, frequency, cutoff, level) {
+  const osc = AC.createOscillator();
+  osc.type = type;
+  osc.frequency.value = frequency;
+  const filter = AC.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = cutoff;
+  const voiceGain = AC.createGain();
+  voiceGain.gain.value = level;
+  const lfo = AC.createOscillator();
+  lfo.frequency.value = rand(0.05, 0.22);
+  const lfoGain = AC.createGain();
+  lfoGain.gain.value = rand(3, 9);
+  lfo.connect(lfoGain).connect(osc.detune);
+  osc.connect(filter).connect(voiceGain).connect(destination);
+  osc.start(); lfo.start();
+}
+
+function initAudio() {
+  AC = new (window.AudioContext || window.webkitAudioContext)();
+  const compressor = AC.createDynamicsCompressor();
+  masterGain = AC.createGain();
+  masterGain.gain.value = 0;
+  masterGain.connect(compressor).connect(AC.destination);
+
+  const noiseLen = 2 * AC.sampleRate;
+  const noiseBuf = AC.createBuffer(1, noiseLen, AC.sampleRate);
+  const data = noiseBuf.getChannelData(0);
+  for (let i = 0; i < noiseLen; i++) data[i] = Math.random() * 2 - 1;
+  const noiseSrc = AC.createBufferSource();
+  noiseSrc.buffer = noiseBuf; noiseSrc.loop = true;
+  const noiseFilter = AC.createBiquadFilter();
+  noiseFilter.type = 'bandpass';
+  noiseFilter.frequency.value = 1100;
+  noiseFilter.Q.value = 0.4;
+  noiseGainNode = AC.createGain();
+  noiseGainNode.gain.value = 0;
+  noiseSrc.connect(noiseFilter).connect(noiseGainNode).connect(masterGain);
+  noiseSrc.start();
+
+  for (const st of STATIONS) {
+    if (!st.voices) continue;
+    st.gainNode = AC.createGain();
+    st.gainNode.gain.value = 0;
+    st.gainNode.connect(masterGain);
+    st.gainSmooth = 0;
+    for (const v of st.voices) buildVoice(st.gainNode, v.type, v.f, v.cut, v.lvl);
+  }
+}
+
+function updateAudio(dt, noiseLevel) {
+  if (!AC) return;
+  const targetMaster = muted ? 0 : 0.65;
+  masterLevel = lerp(masterLevel, targetMaster, Math.min(1, dt * 4));
+  masterGain.gain.value = masterLevel;
+  noiseLevelSmooth = lerp(noiseLevelSmooth, noiseLevel * 0.16, Math.min(1, dt * 8));
+  noiseGainNode.gain.value = noiseLevelSmooth;
+  for (const st of STATIONS) {
+    if (!st.gainNode) continue;
+    st.gainSmooth = lerp(st.gainSmooth, st.signal * st.audioLevel, Math.min(1, dt * 8));
+    st.gainNode.gain.value = st.gainSmooth;
+  }
+}
+
+// ---------------------------------------------------------------- static / noise
+
+const noiseCanvas = document.createElement('canvas');
+noiseCanvas.width = 192; noiseCanvas.height = 108;
+const noiseCtx = noiseCanvas.getContext('2d');
+const noiseImage = noiseCtx.createImageData(192, 108);
+let tearY = -1, tearLife = 0;
+
+function drawStatic(level) {
+  if (level < 0.015) return;
+  const px = noiseImage.data;
+  const bright = 90 + level * 165;
+  for (let i = 0; i < px.length; i += 4) {
+    const v = (Math.random() * bright) | 0;
+    px[i] = v; px[i + 1] = v; px[i + 2] = v; px[i + 3] = 255;
+  }
+  noiseCtx.putImageData(noiseImage, 0, 0);
+  ctx.save();
+  ctx.globalAlpha = clamp(level, 0, 1) * 0.92;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(noiseCanvas, 0, 0, W, H);
+  ctx.imageSmoothingEnabled = true;
+
+  if (tearLife <= 0 && Math.random() < level * 0.04) {
+    tearY = Math.random() * H;
+    tearLife = rand(0.1, 0.4);
+  }
+  if (tearLife > 0) {
+    ctx.globalAlpha = level * 0.5;
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, tearY, W, 2);
+    ctx.globalAlpha = level * 0.2;
+    ctx.fillRect(0, tearY - 8, W, 18);
+    tearY += rand(-30, 30);
+  }
+  ctx.restore();
+}
+
+// ================================================================ STATIONS
+
+// ------------------------------------------------ 88.3 THE RAIN
+const RAIN_GLYPHS = 'アイウエオカキクケコサシスセソタチツテトナニヌネノ0123456789$#%&@ZX';
+const stationRain = {
+  id: 'rain', f: 88.3, name: 'THE RAIN', sub: 'it remembers being code',
+  hint: 'it is afraid of your cursor. click to scatter it.',
+  audioLevel: 0.10,
+  voices: [
+    { type: 'sawtooth', f: 55, cut: 240, lvl: 0.5 },
+    { type: 'sawtooth', f: 82.5, cut: 240, lvl: 0.35 },
+    { type: 'sine', f: 110, cut: 500, lvl: 0.25 },
+  ],
+  signal: 0, streams: [], cs: 18, shock: null,
+
+  resize() {
+    const count = Math.ceil(W / this.cs);
+    this.streams = [];
+    for (let i = 0; i < count; i++) {
+      this.streams.push({
+        col: i, y: rand(-H, H), sp: rand(130, 380), len: (rand(8, 22)) | 0,
+        xoff: 0, xv: 0, seed: (Math.random() * 1000) | 0,
+      });
+    }
+  },
+
+  onClick(x, y) { this.shock = { x, y, t: 0 }; },
+
+  update(dt) {
+    if (this.shock) {
+      this.shock.t += dt;
+      if (this.shock.t > 0.7) this.shock = null;
+    }
+    const panic = clamp(mouse.speed / 1800, 0, 1.4);
+    for (const s of this.streams) {
+      const headX = s.col * this.cs + this.cs / 2 + s.xoff;
+      const dx = headX - mouse.x;
+      const dy = s.y - mouse.y;
+      const d2 = dx * dx + dy * dy;
+      let fear = 0;
+      if (d2 < 180 * 180) {
+        const d = Math.sqrt(d2) + 1;
+        fear = (1 - d / 180);
+        s.xv += (dx / d) * fear * 2400 * dt;
+      }
+      if (this.shock) {
+        const sx = headX - this.shock.x, sy = s.y - this.shock.y;
+        const sd = Math.hypot(sx, sy) + 1;
+        const wave = Math.abs(sd - this.shock.t * 1400);
+        if (wave < 90) {
+          s.xv += (sx / sd) * 3000 * dt * (1 - wave / 90);
+          s.y += (sy / sd) * 900 * dt * (1 - wave / 90);
+        }
+      }
+      s.xv += -s.xoff * 5 * dt;
+      s.xv *= Math.pow(0.04, dt);
+      s.xoff = clamp(s.xoff + s.xv * dt, -70, 70);
+      s.y += s.sp * (1 + fear * 2.2 + panic * 0.6) * dt;
+      if (s.y - s.len * this.cs > H) {
+        s.y = rand(-300, -40);
+        s.sp = rand(130, 380);
+        s.len = (rand(8, 22)) | 0;
+        s.seed = (Math.random() * 1000) | 0;
+      }
+    }
+  },
+
+  draw(a) {
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.font = this.cs + 'px "VT323", monospace';
+    ctx.textBaseline = 'top';
+    const flick = Math.floor(timeNow * 9);
+    for (const s of this.streams) {
+      const x = s.col * this.cs + s.xoff;
+      for (let i = 0; i < s.len; i++) {
+        const y = s.y - i * this.cs;
+        if (y < -this.cs || y > H) continue;
+        const gi = (s.seed + s.col * 31 + ((y / this.cs) | 0) * 7 + ((flick + i) % 3 === 0 ? flick : 0)) % RAIN_GLYPHS.length;
+        const fade = 1 - i / s.len;
+        if (i === 0) {
+          ctx.fillStyle = 'rgba(220,255,230,' + (0.95 * a) + ')';
+        } else {
+          ctx.fillStyle = 'rgba(40,255,110,' + (fade * 0.85 * a).toFixed(3) + ')';
+        }
+        ctx.fillText(RAIN_GLYPHS[Math.abs(gi)], x, y);
+      }
+    }
+    ctx.restore();
+  },
+};
+
+// ------------------------------------------------ 91.7 BLOOM (Game of Life)
+const stationBloom = {
+  id: 'bloom', f: 91.7, name: 'BLOOM', sub: 'a garden playing itself',
+  hint: 'paint with your cursor. life does the rest.',
+  audioLevel: 0.07,
+  voices: [
+    { type: 'sine', f: 220, cut: 1200, lvl: 0.30 },
+    { type: 'sine', f: 261.6, cut: 1200, lvl: 0.24 },
+    { type: 'sine', f: 329.6, cut: 1200, lvl: 0.20 },
+    { type: 'triangle', f: 110, cut: 600, lvl: 0.25 },
+  ],
+  signal: 0, cell: 10, cols: 0, rows: 0,
+  grid: null, next: null, age: null, energy: null,
+  stepTimer: 0, lifeCanvas: null, lifeCtx: null, lifeImage: null,
+
+  resize() {
+    this.cols = Math.ceil(W / this.cell);
+    this.rows = Math.ceil(H / this.cell);
+    const n = this.cols * this.rows;
+    this.grid = new Uint8Array(n);
+    this.next = new Uint8Array(n);
+    this.age = new Uint16Array(n);
+    this.energy = new Float32Array(n);
+    for (let i = 0; i < n; i++) this.grid[i] = Math.random() < 0.10 ? 1 : 0;
+    this.lifeCanvas = document.createElement('canvas');
+    this.lifeCanvas.width = this.cols; this.lifeCanvas.height = this.rows;
+    this.lifeCtx = this.lifeCanvas.getContext('2d');
+    this.lifeImage = this.lifeCtx.createImageData(this.cols, this.rows);
+  },
+
+  paint(x, y) {
+    const cx = (x / this.cell) | 0, cy = (y / this.cell) | 0;
+    for (let oy = -2; oy <= 2; oy++) {
+      for (let ox = -2; ox <= 2; ox++) {
+        if (Math.random() < 0.55) {
+          const gx = (cx + ox + this.cols) % this.cols;
+          const gy = (cy + oy + this.rows) % this.rows;
+          this.grid[gy * this.cols + gx] = 1;
+        }
+      }
+    }
+  },
+
+  onClick(x, y) { this.paint(x, y); },
+
+  step() {
+    const { cols, rows, grid, next, age } = this;
+    for (let y = 0; y < rows; y++) {
+      const ym = ((y - 1 + rows) % rows) * cols;
+      const y0 = y * cols;
+      const yp = ((y + 1) % rows) * cols;
+      for (let x = 0; x < cols; x++) {
+        const xm = (x - 1 + cols) % cols;
+        const xp = (x + 1) % cols;
+        const n =
+          grid[ym + xm] + grid[ym + x] + grid[ym + xp] +
+          grid[y0 + xm] + grid[y0 + xp] +
+          grid[yp + xm] + grid[yp + x] + grid[yp + xp];
+        const i = y0 + x;
+        const alive = grid[i] ? (n === 2 || n === 3) : (n === 3);
+        next[i] = alive ? 1 : 0;
+        age[i] = alive ? Math.min(age[i] + 1, 600) : 0;
+      }
+    }
+    this.grid = next;
+    this.next = grid;
+  },
+
+  update(dt) {
+    if (mouse.down && !dialZone(mouse.y)) this.paint(mouse.x, mouse.y);
+    this.stepTimer += dt;
+    if (this.stepTimer > 0.085) {
+      this.stepTimer = 0;
+      this.step();
+    }
+    const decay = Math.pow(0.25, dt);
+    const { grid, energy } = this;
+    for (let i = 0; i < energy.length; i++) {
+      energy[i] = grid[i] ? 1 : energy[i] * decay;
+    }
+  },
+
+  draw(a) {
+    const px = this.lifeImage.data;
+    const { energy, age } = this;
+    for (let i = 0; i < energy.length; i++) {
+      const e = energy[i];
+      const o = i * 4;
+      if (e < 0.02) { px[o + 3] = 0; continue; }
+      const hue = (140 + Math.min(age[i], 120) * 1.8) % 360;
+      const c = hue / 60 | 0;
+      const f = hue / 60 - c;
+      const v = 255, p = 64, q = (255 - (255 - 64) * f) | 0, t = (64 + (255 - 64) * f) | 0;
+      let r, g, b;
+      switch (c % 6) {
+        case 0: r = v; g = t; b = p; break;
+        case 1: r = q; g = v; b = p; break;
+        case 2: r = p; g = v; b = t; break;
+        case 3: r = p; g = q; b = v; break;
+        case 4: r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+      }
+      px[o] = r; px[o + 1] = g; px[o + 2] = b;
+      px[o + 3] = (e * 235) | 0;
+    }
+    this.lifeCtx.putImageData(this.lifeImage, 0, 0);
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(this.lifeCanvas, 0, 0, W, H);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = a * 0.35;
+    ctx.drawImage(this.lifeCanvas, -2, -2, W + 4, H + 4);
+    ctx.restore();
+  },
+};
+
+// ------------------------------------------------ 95.5 COLLAPSE (gravity wells)
+const stationCollapse = {
+  id: 'collapse', f: 95.5, name: 'COLLAPSE', sub: 'everything falls eventually',
+  hint: 'click to place a singularity. it grows as it eats.',
+  audioLevel: 0.14,
+  voices: [
+    { type: 'sine', f: 36.7, cut: 200, lvl: 0.6 },
+    { type: 'sine', f: 73.4, cut: 300, lvl: 0.3 },
+    { type: 'triangle', f: 49, cut: 200, lvl: 0.25 },
+  ],
+  signal: 0, particles: [], wells: [], trail: null, trailCtx: null,
+
+  resize() {
+    this.trail = document.createElement('canvas');
+    this.trail.width = W; this.trail.height = H;
+    this.trailCtx = this.trail.getContext('2d');
+    this.particles = [];
+    for (let i = 0; i < 850; i++) this.particles.push(this.spawn());
+    this.wells = [];
+  },
+
+  spawn() {
+    return {
+      x: rand(0, W), y: rand(0, H),
+      vx: rand(-25, 25), vy: rand(-25, 25),
+    };
+  },
+
+  spawnEdge() {
+    const side = (Math.random() * 4) | 0;
+    const p = this.spawn();
+    if (side === 0) { p.x = -5; p.vx = rand(10, 60); }
+    if (side === 1) { p.x = W + 5; p.vx = rand(-60, -10); }
+    if (side === 2) { p.y = -5; p.vy = rand(10, 60); }
+    if (side === 3) { p.y = H + 5; p.vy = rand(-60, -10); }
+    return p;
+  },
+
+  onClick(x, y) {
+    if (this.wells.length >= 4) this.wells.shift();
+    this.wells.push({ x, y, m: 1, age: 0, life: rand(16, 26), eaten: 0 });
+  },
+
+  update(dt) {
+    for (let i = this.wells.length - 1; i >= 0; i--) {
+      const w = this.wells[i];
+      w.age += dt;
+      if (w.age > w.life) this.wells.splice(i, 1);
+    }
+    for (let i = 0; i < this.particles.length; i++) {
+      const p = this.particles[i];
+      if (this.wells.length === 0) {
+        p.vx += Math.sin(p.y * 0.01 + timeNow * 0.3) * 14 * dt;
+        p.vy += Math.cos(p.x * 0.01 + timeNow * 0.21) * 14 * dt;
+      }
+      for (const w of this.wells) {
+        const dx = w.x - p.x, dy = w.y - p.y;
+        const r2 = dx * dx + dy * dy + 600;
+        const r = Math.sqrt(r2);
+        const force = Math.min(26000 * w.m / r2, 2600);
+        p.vx += (dx / r) * force * dt;
+        p.vy += (dy / r) * force * dt;
+        if (r < 9 + w.m * 2) {
+          w.m = Math.min(w.m + 0.05, 7);
+          w.eaten++;
+          this.particles[i] = this.spawnEdge();
+        }
+      }
+      p.vx *= Math.pow(0.75, dt);
+      p.vy *= Math.pow(0.75, dt);
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      if (p.x < -60 || p.x > W + 60 || p.y < -60 || p.y > H + 60) {
+        this.particles[i] = this.wells.length ? this.spawnEdge() : this.spawn();
+      }
+    }
+  },
+
+  draw(a) {
+    const tc = this.trailCtx;
+    tc.fillStyle = 'rgba(2,0,8,0.16)';
+    tc.fillRect(0, 0, W, H);
+    for (const p of this.particles) {
+      const speed = Math.hypot(p.vx, p.vy);
+      const k = clamp(speed / 700, 0, 1);
+      const hue = 225 + k * 110;
+      const light = 45 + k * 45;
+      tc.fillStyle = 'hsl(' + hue.toFixed(0) + ',90%,' + light.toFixed(0) + '%)';
+      tc.fillRect(p.x, p.y, 2, 2);
+    }
+    for (const w of this.wells) {
+      const fade = clamp(1 - (w.age / w.life - 0.8) * 5, 0, 1);
+      const radius = 8 + w.m * 2;
+      const grad = tc.createRadialGradient(w.x, w.y, 0, w.x, w.y, radius * 6);
+      grad.addColorStop(0, 'rgba(0,0,0,1)');
+      grad.addColorStop(0.4, 'rgba(80,20,140,' + (0.5 * fade) + ')');
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      tc.fillStyle = grad;
+      tc.beginPath();
+      tc.arc(w.x, w.y, radius * 6, 0, TAU);
+      tc.fill();
+      tc.strokeStyle = 'rgba(255,180,255,' + (0.8 * fade) + ')';
+      tc.lineWidth = 1.5;
+      tc.beginPath();
+      tc.arc(w.x, w.y, radius + Math.sin(timeNow * 5 + w.eaten) * 2, 0, TAU);
+      tc.stroke();
+    }
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.drawImage(this.trail, 0, 0);
+    ctx.restore();
+  },
+};
+
+// ------------------------------------------------ 99.1 THE GHOST (typewriter)
+const GHOST_OPEN = ['i remember', 'i dreamt', 'they said', 'the static said', 'at 3am', 'before the towers fell', 'under the floorboards', 'in the last broadcast', 'when the dial broke', 'between the stations', 'after everyone left'];
+const GHOST_MID = ['the rain sounded like', 'everyone forgot', 'i kept hearing', 'nobody answered', 'the lights spelled out', 'we buried', 'i transcribed', 'the frequencies hid', 'someone whispered', 'the antenna caught', 'the silence rehearsed'];
+const GHOST_END = ['my own name.', 'a song i never learned.', 'your voice. yes, yours.', 'the shape of the house.', 'static, all the way down.', 'a number station, counting backwards.', 'the sea, but wrong.', 'tomorrow\'s weather, yesterday.', 'an apology, unsigned.', 'the gap between stations.', 'a door closing forever.', 'the sound teeth make when they dream.'];
+const GHOST_SHORT = ['are you still there?', 'keep the dial warm.', 'do not adjust your set.', 'it is always 3am here.', 'the static is just applause.', 'i was the operator.', 'stay tuned. stay.', 'this is not a recording.'];
+const GHOST_REPLIES = ['i heard that.', 'the keys remember your fingers.', 'say it again. slower.', 'i will transcribe that forever.', 'that one goes in the log.', 'careful. the dial listens.', 'yes. exactly. yes.', 'noted. filed. never forgotten.'];
+const GHOST_TRIGGERS = [
+  [/hello|^hi\b|\bhi$/i, 'hello. you came back.'],
+  [/who are you|who r u|\bwho\b/i, 'i was the operator. i am the operator.'],
+  [/name/i, 'names dissolve in static. yours is safe with me.'],
+  [/help/i, 'no one is coming. but the music is nice.'],
+  [/why/i, 'because someone has to keep typing.'],
+  [/bye|goodbye/i, 'you always say that.'],
+  [/love/i, 'that frequency is reserved.'],
+  [/dead|ghost/i, 'rude. accurate, but rude.'],
+];
+
+const stationGhost = {
+  id: 'ghost', f: 99.1, name: 'THE GHOST', sub: 'transmitting since 1987',
+  hint: 'type something. it answers.',
+  audioLevel: 0.05,
+  voices: [
+    { type: 'sine', f: 392, cut: 900, lvl: 0.18 },
+    { type: 'sine', f: 196, cut: 600, lvl: 0.22 },
+    { type: 'triangle', f: 587, cut: 1400, lvl: 0.07 },
+  ],
+  signal: 0, lines: [{ who: 'ghost', text: '' }], queue: [], typeTimer: 0,
+  pauseUntil: 0, userTypedAt: -99, pendingReply: null,
+
+  resize() {},
+
+  composeSentence() {
+    if (Math.random() < 0.3) return pick(GHOST_SHORT);
+    return pick(GHOST_OPEN) + ', ' + pick(GHOST_MID) + ' ' + pick(GHOST_END);
+  },
+
+  enqueue(text, correction) {
+    this.queue.push({ nl: true });
+    for (const ch of text) this.queue.push(ch);
+    if (correction && Math.random() < 0.18) {
+      const wrong = pick([' wait.', ' no.', ' that is wrong.']);
+      for (let i = 0; i < text.split(' ').pop().length + 1; i++) this.queue.push({ bs: true });
+      for (const ch of wrong) this.queue.push(ch);
+    }
+    this.queue.push({ pause: rand(0.7, 2.2) });
+  },
+
+  onKey(key) {
+    const last = this.lines[this.lines.length - 1];
+    if (key === 'Backspace') {
+      if (last.who === 'user' && last.text.length) last.text = last.text.slice(0, -1);
+      this.userTypedAt = timeNow;
+      return;
+    }
+    if (key === 'Enter') {
+      if (last.who === 'user' && last.text.trim()) this.prepareReply(last.text);
+      this.lines.push({ who: 'user', text: '' });
+      this.userTypedAt = timeNow;
+      return;
+    }
+    if (last.who !== 'user') this.lines.push({ who: 'user', text: '' });
+    const line = this.lines[this.lines.length - 1];
+    line.text += key;
+    if (line.text.length > this.maxChars()) this.lines.push({ who: 'user', text: '' });
+    this.userTypedAt = timeNow;
+  },
+
+  prepareReply(userText) {
+    for (const [re, reply] of GHOST_TRIGGERS) {
+      if (re.test(userText)) { this.pendingReply = reply; return; }
+    }
+    this.pendingReply = pick(GHOST_REPLIES);
+  },
+
+  maxChars() { return Math.max(20, ((W * 0.78) / 11) | 0); },
+
+  update(dt) {
+    const sinceUser = timeNow - this.userTypedAt;
+    const userLine = this.lines[this.lines.length - 1];
+    if (userLine.who === 'user' && userLine.text.trim() && sinceUser > 2.0 && !this.pendingReply) {
+      this.prepareReply(userLine.text);
+    }
+    if (sinceUser < 1.6) return;
+    if (timeNow < this.pauseUntil) return;
+
+    if (this.queue.length === 0) {
+      if (this.pendingReply) {
+        this.enqueue(this.pendingReply, false);
+        this.pendingReply = null;
+      } else {
+        this.enqueue(this.composeSentence(), true);
+      }
+    }
+
+    this.typeTimer -= dt;
+    if (this.typeTimer > 0) return;
+    this.typeTimer = rand(0.03, 0.10);
+
+    const token = this.queue.shift();
+    if (typeof token === 'string') {
+      let last = this.lines[this.lines.length - 1];
+      if (last.who !== 'ghost') { this.lines.push({ who: 'ghost', text: '' }); last = this.lines[this.lines.length - 1]; }
+      last.text += token;
+      if (token === ' ' && last.text.length > this.maxChars()) this.lines.push({ who: 'ghost', text: '' });
+    } else if (token.nl) {
+      this.lines.push({ who: 'ghost', text: '' });
+    } else if (token.bs) {
+      const last = this.lines[this.lines.length - 1];
+      if (last.text.length) last.text = last.text.slice(0, -1);
+      this.typeTimer = 0.09;
+    } else if (token.pause) {
+      this.pauseUntil = timeNow + token.pause;
+    }
+    if (this.lines.length > 30) this.lines.splice(0, this.lines.length - 30);
+  },
+
+  draw(a) {
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.font = '24px "VT323", monospace';
+    ctx.textBaseline = 'alphabetic';
+    const lineHeight = 30;
+    const baseX = Math.max(40, W * 0.11);
+    let y = H - 150;
+    const visible = Math.min(this.lines.length, ((H - 200) / lineHeight) | 0);
+    for (let i = this.lines.length - 1; i >= this.lines.length - visible; i--) {
+      const line = this.lines[i];
+      const fade = 1 - (this.lines.length - 1 - i) / visible;
+      let x = baseX;
+      for (let c = 0; c < line.text.length; c++) {
+        const charX = x + c * 11;
+        const d2m = dist2(charX, y, mouse.x, mouse.y);
+        let jx = 0, jy = 0;
+        if (d2m < 110 * 110) {
+          const k = 1 - Math.sqrt(d2m) / 110;
+          jx = rand(-4, 4) * k;
+          jy = rand(-4, 4) * k;
+        }
+        ctx.fillStyle = line.who === 'user'
+          ? 'rgba(255,190,90,' + (0.95 * fade * a) + ')'
+          : 'rgba(170,255,190,' + (0.85 * fade * a) + ')';
+        ctx.fillText(line.text[c], charX + jx, y + jy);
+      }
+      if (i === this.lines.length - 1 && Math.floor(timeNow * 2.4) % 2 === 0) {
+        ctx.fillStyle = 'rgba(220,255,230,' + (0.9 * a) + ')';
+        ctx.fillRect(x + line.text.length * 11 + 2, y - 18, 11, 22);
+      }
+      y -= lineHeight;
+      if (y < 90) break;
+    }
+    ctx.restore();
+  },
+};
+
+// ------------------------------------------------ 103.9 FIRMAMENT (constellations)
+const CONST_A = ['VESPER', 'HOLLOW', 'PALE', 'SILENT', 'DROWNED', 'IRON', 'LAST', 'WANDERING', 'BROKEN', 'SLEEPING'];
+const CONST_B = ['CROWN', 'SERPENT', 'ANTLER', 'LANTERN', 'ORPHAN', 'VEIL', 'HARP', 'KEY', 'HOUND', 'ANCHOR'];
+
+const stationSky = {
+  id: 'sky', f: 103.9, name: 'FIRMAMENT', sub: 'the sky is unfinished',
+  hint: 'click to place stars. four nearby become a constellation. [c] clears.',
+  audioLevel: 0.06,
+  voices: [
+    { type: 'triangle', f: 523.25, cut: 2400, lvl: 0.10 },
+    { type: 'triangle', f: 659.25, cut: 2400, lvl: 0.08 },
+    { type: 'triangle', f: 784, cut: 2400, lvl: 0.06 },
+    { type: 'sine', f: 130.8, cut: 500, lvl: 0.22 },
+  ],
+  signal: 0, bgStars: [], userStars: [], names: [], shooting: null, shootTimer: 5,
+
+  resize() {
+    this.bgStars = [];
+    for (let i = 0; i < 320; i++) {
+      this.bgStars.push({
+        x: Math.random() * W, y: Math.random() * H,
+        r: rand(0.4, 1.6), tw: rand(0, TAU), depth: rand(0.3, 1),
+      });
+    }
+  },
+
+  clearSky() { this.userStars = []; this.names = []; },
+
+  onClick(x, y) {
+    if (this.userStars.length >= 110) this.userStars.shift();
+    this.userStars.push({ x, y, born: timeNow });
+    this.findConstellations();
+  },
+
+  findConstellations() {
+    const stars = this.userStars;
+    const parent = stars.map((_, i) => i);
+    const find = i => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+    for (let i = 0; i < stars.length; i++) {
+      for (let j = i + 1; j < stars.length; j++) {
+        if (dist2(stars[i].x, stars[i].y, stars[j].x, stars[j].y) < 170 * 170) {
+          parent[find(i)] = find(j);
+        }
+      }
+    }
+    const clusters = {};
+    stars.forEach((s, i) => {
+      const root = find(i);
+      (clusters[root] = clusters[root] || []).push(s);
+    });
+    for (const root in clusters) {
+      const cluster = clusters[root];
+      if (cluster.length < 4) continue;
+      const cx = cluster.reduce((a, s) => a + s.x, 0) / cluster.length;
+      const cy = cluster.reduce((a, s) => a + s.y, 0) / cluster.length;
+      const near = this.names.find(n => dist2(n.x, n.y, cx, cy) < 220 * 220);
+      if (near) { near.x = cx; near.y = cy; near.count = cluster.length; continue; }
+      this.names.push({ x: cx, y: cy, text: 'THE ' + pick(CONST_A) + ' ' + pick(CONST_B), born: timeNow, count: cluster.length });
+    }
+  },
+
+  update(dt) {
+    this.shootTimer -= dt;
+    if (this.shootTimer < 0 && !this.shooting) {
+      this.shooting = { x: rand(W * 0.2, W * 0.9), y: rand(0, H * 0.3), vx: rand(-900, -500), vy: rand(200, 420), t: 0 };
+      this.shootTimer = rand(6, 15);
+    }
+    if (this.shooting) {
+      this.shooting.t += dt;
+      this.shooting.x += this.shooting.vx * dt;
+      this.shooting.y += this.shooting.vy * dt;
+      if (this.shooting.t > 1.4 || this.shooting.x < -100) this.shooting = null;
+    }
+  },
+
+  draw(a) {
+    ctx.save();
+    ctx.globalAlpha = a;
+    const offX = (mouse.x - W / 2) * -0.012;
+    const offY = (mouse.y - H / 2) * -0.012;
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, 'rgba(4,6,26,' + a + ')');
+    grad.addColorStop(1, 'rgba(10,4,24,' + a + ')');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    for (const s of this.bgStars) {
+      const tw = 0.45 + 0.55 * Math.sin(timeNow * 1.7 + s.tw);
+      ctx.fillStyle = 'rgba(200,215,255,' + (tw * 0.8 * a * s.depth).toFixed(3) + ')';
+      ctx.fillRect(s.x + offX * s.depth, s.y + offY * s.depth, s.r, s.r);
+    }
+
+    if (this.shooting) {
+      const sh = this.shooting;
+      const fade = 1 - sh.t / 1.4;
+      ctx.strokeStyle = 'rgba(255,255,255,' + (fade * 0.9 * a) + ')';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(sh.x, sh.y);
+      ctx.lineTo(sh.x - sh.vx * 0.13, sh.y - sh.vy * 0.13);
+      ctx.stroke();
+    }
+
+    const stars = this.userStars;
+    ctx.lineWidth = 1;
+    for (let i = 0; i < stars.length; i++) {
+      for (let j = i + 1; j < stars.length; j++) {
+        const d2 = dist2(stars[i].x, stars[i].y, stars[j].x, stars[j].y);
+        if (d2 < 170 * 170) {
+          const k = 1 - Math.sqrt(d2) / 170;
+          ctx.strokeStyle = 'rgba(150,190,255,' + (k * 0.55 * a).toFixed(3) + ')';
+          ctx.beginPath();
+          ctx.moveTo(stars[i].x, stars[i].y);
+          ctx.lineTo(stars[j].x, stars[j].y);
+          ctx.stroke();
+        }
+      }
+    }
+    for (const s of stars) {
+      const pulse = 0.7 + 0.3 * Math.sin(timeNow * 2 + s.born * 7);
+      const grow = clamp((timeNow - s.born) * 3, 0, 1);
+      ctx.fillStyle = 'rgba(235,242,255,' + (pulse * a) + ')';
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 2.4 * grow, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(160,200,255,' + (0.18 * pulse * a) + ')';
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 8 * grow, 0, TAU);
+      ctx.fill();
+    }
+    ctx.font = '19px "VT323", monospace';
+    ctx.textAlign = 'center';
+    for (const n of this.names) {
+      const reveal = clamp((timeNow - n.born) * 0.8, 0, 1);
+      const shown = n.text.slice(0, Math.ceil(n.text.length * reveal));
+      ctx.fillStyle = 'rgba(190,215,255,' + (0.85 * a) + ')';
+      ctx.fillText(shown.split('').join(' '), n.x, n.y - 26);
+    }
+    ctx.textAlign = 'left';
+    ctx.restore();
+  },
+};
+
+// ------------------------------------------------ 107.7 THE EYE
+const stationEye = {
+  id: 'eye', f: 107.7, name: 'THE EYE', sub: 'do not stare back',
+  hint: 'it follows. move fast and it flinches. click and it blinks.',
+  audioLevel: 0.11,
+  voices: [
+    { type: 'sine', f: 65.4, cut: 300, lvl: 0.4 },
+    { type: 'sine', f: 69, cut: 300, lvl: 0.4 },
+    { type: 'sine', f: 1318.5, cut: 4000, lvl: 0.02 },
+  ],
+  signal: 0, particles: [], lid: 0, lidTarget: 0, blinkTimer: 3, scatter: 0,
+
+  resize() {
+    this.particles = [];
+    const count = 1300;
+    for (let i = 0; i < count; i++) {
+      this.particles.push({
+        ang: Math.random() * TAU,
+        rad: Math.pow(Math.random(), 0.7),
+        x: Math.random() * W, y: Math.random() * H,
+        vx: 0, vy: 0,
+      });
+    }
+  },
+
+  onClick() { this.lidTarget = 1; this.blinkTimer = 0.22; },
+
+  update(dt) {
+    const cx = W / 2, cy = H / 2;
+    const eyeRadius = Math.min(W, H) * 0.24;
+
+    this.blinkTimer -= dt;
+    if (this.blinkTimer <= 0) {
+      if (this.lidTarget === 0) { this.lidTarget = 1; this.blinkTimer = 0.18; }
+      else { this.lidTarget = 0; this.blinkTimer = rand(2.5, 6.5); }
+    }
+    this.lid = lerp(this.lid, this.lidTarget, Math.min(1, dt * 14));
+
+    if (mouse.speed > 1600 && this.scatter <= 0) {
+      this.scatter = 0.9;
+      for (const p of this.particles) {
+        p.vx += rand(-700, 700);
+        p.vy += rand(-700, 700);
+      }
+    }
+    if (this.scatter > 0) this.scatter -= dt;
+
+    const toMouseX = mouse.x - cx, toMouseY = mouse.y - cy;
+    const mouseDist = Math.hypot(toMouseX, toMouseY) + 0.001;
+    const lookMag = Math.min(mouseDist, eyeRadius * 0.32);
+    const lookX = (toMouseX / mouseDist) * lookMag;
+    const lookY = (toMouseY / mouseDist) * lookMag;
+    const proximity = clamp(1 - mouseDist / (eyeRadius * 2.5), 0, 1);
+    const pupilRadius = eyeRadius * (0.26 + proximity * 0.22);
+    const springK = this.scatter > 0 ? 4 : 26;
+
+    for (const p of this.particles) {
+      const wobble = Math.sin(timeNow * 0.8 + p.ang * 3) * eyeRadius * 0.02;
+      const r = pupilRadius + p.rad * (eyeRadius - pupilRadius) + wobble;
+      const hx = cx + lookX + Math.cos(p.ang) * r;
+      let hy = cy + lookY + Math.sin(p.ang) * r;
+      hy = cy + lookY + (hy - cy - lookY) * (1 - this.lid * 0.96) * 0.78;
+      p.vx += (hx - p.x) * springK * dt;
+      p.vy += (hy - p.y) * springK * dt;
+      p.vx *= Math.pow(0.012, dt);
+      p.vy *= Math.pow(0.012, dt);
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.ang += dt * 0.05 * (p.rad > 0.5 ? 1 : -1.4);
+    }
+  },
+
+  draw(a) {
+    const cx = W / 2, cy = H / 2;
+    const eyeRadius = Math.min(W, H) * 0.24;
+    ctx.save();
+    ctx.globalAlpha = a;
+    const bg = ctx.createRadialGradient(cx, cy, eyeRadius * 0.2, cx, cy, Math.max(W, H) * 0.7);
+    bg.addColorStop(0, 'rgba(40,4,8,' + (0.9 * a) + ')');
+    bg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.globalCompositeOperation = 'lighter';
+    for (const p of this.particles) {
+      const hue = 18 + Math.sin(p.ang * 5) * 14 + p.rad * 38;
+      ctx.fillStyle = 'hsla(' + hue.toFixed(0) + ',85%,55%,' + (0.5 * a).toFixed(3) + ')';
+      ctx.fillRect(p.x, p.y, 2, 2);
+    }
+    const toMouseX = mouse.x - cx, toMouseY = mouse.y - cy;
+    const mouseDist = Math.hypot(toMouseX, toMouseY) + 0.001;
+    const lookMag = Math.min(mouseDist, eyeRadius * 0.32);
+    const px = cx + (toMouseX / mouseDist) * lookMag;
+    const py = cy + (toMouseY / mouseDist) * lookMag;
+    const glow = ctx.createRadialGradient(px, py, 0, px, py, eyeRadius * 0.5);
+    glow.addColorStop(0, 'rgba(255,30,30,' + (0.30 * (1 - this.lid) * a) + ')');
+    glow.addColorStop(1, 'rgba(255,30,30,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(px - eyeRadius, py - eyeRadius, eyeRadius * 2, eyeRadius * 2);
+    ctx.restore();
+  },
+};
+
+// ------------------------------------------------ 87.0 DEAD AIR (hidden)
+const stationDeadAir = {
+  id: 'deadair', f: 87.0, name: 'DEAD AIR', sub: '', hint: '',
+  hidden: true, audioLevel: 0.0,
+  signal: 0, tunedFor: 0,
+  resize() {},
+  update(dt) {
+    if (this.signal > 0.8) this.tunedFor += dt; else this.tunedFor = 0;
+  },
+  draw(a) {
+    const beat = Math.pow(Math.max(0, Math.sin(timeNow * 1.1)), 12);
+    ctx.save();
+    ctx.globalAlpha = a;
+    const grad = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.min(W, H) * 0.4);
+    grad.addColorStop(0, 'rgba(120,0,0,' + (0.05 + beat * 0.07) + ')');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+    ctx.font = '22px "VT323", monospace';
+    ctx.textAlign = 'center';
+    if (this.tunedFor > 3) {
+      ctx.fillStyle = 'rgba(160,60,60,' + (a * clamp(this.tunedFor - 3, 0, 1)) + ')';
+      ctx.fillText('there is nothing at the bottom of the dial.', W / 2, H / 2);
+    }
+    if (this.tunedFor > 7) {
+      ctx.fillStyle = 'rgba(120,50,50,' + (a * clamp(this.tunedFor - 7, 0, 1) * 0.8) + ')';
+      ctx.fillText('(you can go back up now.)', W / 2, H / 2 + 36);
+    }
+    ctx.textAlign = 'left';
+    ctx.restore();
+  },
+};
+
+const STATIONS = [stationDeadAir, stationRain, stationBloom, stationCollapse, stationGhost, stationSky, stationEye];
+
+function strongestStation() {
+  let best = null;
+  for (const st of STATIONS) if (!best || st.signal > best.signal) best = st;
+  return best;
+}
+
+// ---------------------------------------------------------------- UI drawing
+
+function drawUI(maxSignal) {
+  const flicker = 0.86 + Math.random() * 0.14;
+  ctx.save();
+  ctx.textBaseline = 'alphabetic';
+
+  ctx.font = '20px "VT323", monospace';
+  ctx.fillStyle = 'rgba(110,190,130,' + (0.85 * flicker) + ')';
+  ctx.fillText('NIGHTDIAL', 28, 40);
+  ctx.font = '56px "VT323", monospace';
+  ctx.fillStyle = 'rgba(190,255,205,' + (0.92 * flicker) + ')';
+  const freqText = freq.toFixed(1);
+  ctx.fillText(freqText, 28, 92);
+  const freqWidth = ctx.measureText(freqText).width;
+  ctx.font = '22px "VT323", monospace';
+  ctx.fillStyle = 'rgba(110,190,130,0.7)';
+  ctx.fillText('MHz', 28 + freqWidth + 12, 92);
+
+  const active = strongestStation();
+  if (active && active.signal > 0.25 && !active.hidden) {
+    const a = clamp((active.signal - 0.25) / 0.5, 0, 1);
+    ctx.textAlign = 'center';
+    ctx.font = '42px "VT323", monospace';
+    ctx.fillStyle = 'rgba(225,255,235,' + (a * 0.95 * flicker) + ')';
+    ctx.fillText(active.name, W / 2, 64);
+    ctx.font = '20px "VT323", monospace';
+    ctx.fillStyle = 'rgba(140,210,160,' + (a * 0.75) + ')';
+    ctx.fillText(active.sub, W / 2, 92);
+    ctx.textAlign = 'left';
+  }
+
+  const bars = 14;
+  const lit = Math.round(maxSignal * bars);
+  for (let i = 0; i < bars; i++) {
+    const on = i < lit;
+    ctx.fillStyle = on ? 'rgba(120,255,160,' + (0.5 + i / bars * 0.5) + ')' : 'rgba(80,120,90,0.22)';
+    ctx.fillRect(W - 30 - (bars - i) * 11, 34, 7, 16 + i * 1.4);
+  }
+  ctx.font = '16px "VT323", monospace';
+  ctx.fillStyle = 'rgba(110,190,130,0.6)';
+  ctx.textAlign = 'right';
+  ctx.fillText('SIGNAL', W - 30, 24);
+  ctx.textAlign = 'left';
+
+  // ---- dial
+  const dialY = H - 52;
+  ctx.strokeStyle = 'rgba(120,200,140,0.45)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(70, dialY);
+  ctx.lineTo(W - 70, dialY);
+  ctx.stroke();
+  ctx.font = '16px "VT323", monospace';
+  for (let f = Math.ceil(FREQ_MIN); f <= FREQ_MAX; f++) {
+    const x = freqToX(f);
+    const major = f % 3 === 0;
+    ctx.strokeStyle = 'rgba(120,200,140,' + (major ? 0.55 : 0.3) + ')';
+    ctx.beginPath();
+    ctx.moveTo(x, dialY);
+    ctx.lineTo(x, dialY - (major ? 12 : 7));
+    ctx.stroke();
+    if (major) {
+      ctx.fillStyle = 'rgba(120,200,140,0.55)';
+      ctx.textAlign = 'center';
+      ctx.fillText(String(f), x, dialY + 22);
+    }
+  }
+  ctx.textAlign = 'left';
+
+  for (const st of STATIONS) {
+    if (!foundSet.has(st.f)) continue;
+    const x = freqToX(st.f);
+    const pulse = 0.6 + 0.4 * Math.sin(timeNow * 3 + st.f);
+    ctx.fillStyle = st.hidden
+      ? 'rgba(160,70,70,' + (0.5 * pulse) + ')'
+      : 'rgba(140,255,175,' + (0.85 * pulse) + ')';
+    ctx.beginPath();
+    ctx.arc(x, dialY - 18, 3, 0, TAU);
+    ctx.fill();
+  }
+
+  const needleX = freqToX(freq);
+  ctx.strokeStyle = 'rgba(255,240,200,0.95)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(needleX, dialY - 26);
+  ctx.lineTo(needleX, dialY + 8);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(255,240,200,0.95)';
+  ctx.beginPath();
+  ctx.moveTo(needleX - 5, dialY - 32);
+  ctx.lineTo(needleX + 5, dialY - 32);
+  ctx.lineTo(needleX, dialY - 24);
+  ctx.closePath();
+  ctx.fill();
+  const needleGlow = ctx.createRadialGradient(needleX, dialY - 10, 0, needleX, dialY - 10, 40);
+  needleGlow.addColorStop(0, 'rgba(255,240,200,0.18)');
+  needleGlow.addColorStop(1, 'rgba(255,240,200,0)');
+  ctx.fillStyle = needleGlow;
+  ctx.fillRect(needleX - 40, dialY - 50, 80, 80);
+
+  // ---- hint
+  let hint = '';
+  if (active && active.signal > 0.6 && !active.hidden) hint = active.hint;
+  else if (timeNow - bootAt < 14) hint = 'scroll to tune · or drag the dial';
+  else if ([...foundSet].filter(f => { const s = STATIONS.find(st => st.f === f); return s && !s.hidden; }).length === 0) hint = 'stations hide between the static';
+  if (hint) {
+    ctx.font = '19px "VT323", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(170,225,185,' + (0.55 + 0.2 * Math.sin(timeNow * 2)) + ')';
+    ctx.fillText(hint, W / 2, H - 88);
+    ctx.textAlign = 'left';
+  }
+
+  // ---- footer
+  const foundCount = [...foundSet].filter(f => { const s = STATIONS.find(st => st.f === f); return s && !s.hidden; }).length;
+  ctx.font = '17px "VT323", monospace';
+  ctx.fillStyle = 'rgba(110,190,130,0.6)';
+  ctx.fillText('[space] scan   [m] mute   [←→] fine tune', 28, H - 14);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = foundCount === 6 ? 'rgba(255,230,140,0.9)' : 'rgba(110,190,130,0.7)';
+  ctx.fillText(foundCount === 6 ? 'ALL 6 STATIONS FOUND — THE DIAL IS YOURS' : foundCount + '/6 STATIONS FOUND', W - 28, H - 14);
+  ctx.textAlign = 'left';
+
+  // ---- toasts
+  for (let i = toasts.length - 1; i >= 0; i--) {
+    const tst = toasts[i];
+    const age = timeNow - tst.born;
+    if (age > 3) { toasts.splice(i, 1); continue; }
+    const a = age < 0.3 ? age / 0.3 : age > 2.2 ? 1 - (age - 2.2) / 0.8 : 1;
+    ctx.font = '26px "VT323", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,235,170,' + (a * 0.95) + ')';
+    ctx.fillText(tst.text, W / 2, 140 + i * 34);
+    ctx.textAlign = 'left';
+  }
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------- main loop
+
+function resize() {
+  W = innerWidth; H = innerHeight;
+  screen.width = Math.round(W * dpr);
+  screen.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  for (const st of STATIONS) st.resize();
+}
+addEventListener('resize', resize);
+resize();
+
+let lastFrame = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = clamp((now - lastFrame) / 1000, 0.001, 0.05);
+  lastFrame = now;
+  if (!started) return;
+  timeNow = now / 1000;
+
+  freq = lerp(freq, targetFreq, Math.min(1, dt * 7));
+
+  let maxSignal = 0;
+  for (const st of STATIONS) {
+    const d = Math.abs(freq - st.f);
+    let s = Math.max(0, 1 - (d / 0.62) * (d / 0.62));
+    s = s * s * (3 - 2 * s);
+    st.signal = s;
+    if (s > maxSignal) maxSignal = s;
+    if (s > 0.85 && !foundSet.has(st.f)) {
+      foundSet.add(st.f);
+      persistFound();
+      if (!st.hidden) toast('◉ SIGNAL ACQUIRED — ' + st.name + ' ' + st.f.toFixed(1));
+    }
+  }
+  const noiseLevel = clamp(1 - maxSignal, 0, 1) * 0.96 + 0.04;
+
+  for (const st of STATIONS) if (st.signal > 0.02) st.update(dt);
+
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  const ordered = [...STATIONS].sort((a, b) => a.signal - b.signal);
+  for (const st of ordered) if (st.signal > 0.02) st.draw(st.signal);
+
+  drawStatic(noiseLevel * (0.25 + 0.75 * (1 - maxSignal)));
+  drawUI(maxSignal);
+
+  const boot = timeNow - bootAt;
+  if (boot < 0.8) {
+    const k = boot / 0.8;
+    ctx.fillStyle = 'rgba(255,255,255,' + (1 - k) + ')';
+    const lineH = Math.max(2, H * Math.pow(k, 2.5));
+    ctx.fillRect(0, H / 2 - lineH / 2, W, lineH);
+  }
+
+  updateAudio(dt, noiseLevel);
+}
+requestAnimationFrame(frame);
+
+// ---------------------------------------------------------------- power on
+
+document.getElementById('intro').addEventListener('click', () => {
+  if (started) return;
+  started = true;
+  bootAt = performance.now() / 1000;
+  document.getElementById('intro').classList.add('off');
+  try { initAudio(); } catch (e) {}
+});
+</script>
+</body>
+</html>
